@@ -730,6 +730,52 @@ class SourceResolver {
   }
 
   /**
+   * Mencari stream cadangan di SoundCloud apabila pemutaran YouTube diblokir/meminta login pada IP jaringan.
+   */
+  async findSoundCloudFallback(node, failedTrack) {
+    if (!node || !failedTrack?.info) return null;
+    const rawTitle = String(failedTrack.info.title || '')
+      .replace(/\(.*?\)|\[.*?\]/g, '')
+      .replace(/official\s*(music\s*)?(video|audio|lyric[s]?|visualizer)/gi, '')
+      .trim();
+    const rawAuthor = String(failedTrack.info.author || '')
+      .replace(/\s*-\s*Topic$/i, '')
+      .replace(/VEVO$/i, '')
+      .trim();
+
+    const query = `${rawTitle} ${rawAuthor}`.trim();
+    if (!query) return null;
+
+    try {
+      const res = await node.rest.resolve(`scsearch:${query}`);
+      if (res?.loadType === LoadType.SEARCH && Array.isArray(res.data) && res.data.length > 0) {
+        const targetLen = Number(failedTrack.info.length || 0);
+        let best = res.data[0];
+        if (targetLen > 0) {
+          let bestDiff = Infinity;
+          for (const candidate of res.data.slice(0, 5)) {
+            const diff = Math.abs(Number(candidate.info?.length || 0) - targetLen);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              best = candidate;
+            }
+          }
+        }
+        const fallback = normalizeTrack(best, failedTrack.requester, {
+          artworkUrl: best.info?.artworkUrl || failedTrack.info.artworkUrl || null,
+          originalSource: 'soundcloud'
+        });
+        fallback._retriedViaSoundCloud = true;
+        return fallback;
+      }
+    } catch (err) {
+      logger.debug(`Fallback SoundCloud gagal untuk "${query}": ${err.message}`);
+    }
+
+    return null;
+  }
+
+  /**
    * Titik masuk utama pemrosesan input lagu/URL multi-source.
    */
   async resolve(node, rawQuery, requester) {

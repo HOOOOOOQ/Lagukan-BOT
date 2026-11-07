@@ -429,8 +429,33 @@ class MusicPlayer {
     }
 
     if (reason === 'loadFailed') {
+      const failedTrack = this.currentTrack;
+      const srcName = String(failedTrack?.info?.sourceName || '').toLowerCase();
+
+      // Jika stream YouTube gagal dimuat (misal kena pembatasan login/cipher IP operator),
+      // otomatis alihkan pencarian ke SoundCloud agar suara tetap keluar tanpa henti!
+      if (
+        failedTrack &&
+        !failedTrack._retriedViaSoundCloud &&
+        (srcName.includes('youtube') || srcName === 'ytmusic') &&
+        this.player?.node &&
+        typeof this.client.sourceResolver?.findSoundCloudFallback === 'function'
+      ) {
+        const scFallback = await this.client.sourceResolver.findSoundCloudFallback(
+          this.player.node,
+          failedTrack
+        );
+        if (scFallback?.encoded) {
+          logger.info(
+            `[Guild ${this.guildId}] Mengalihkan stream YouTube "${failedTrack.info.title}" ke SoundCloud fallback.`
+          );
+          await this.playSpecificTrack(scFallback);
+          return;
+        }
+      }
+
       this.consecutiveFailures += 1;
-      const failedTitle = this.currentTrack?.info?.title || 'Lagu';
+      const failedTitle = failedTrack?.info?.title || 'Lagu';
       logger.warn(`[Guild ${this.guildId}] Track loadFailed: ${failedTitle}`);
       await this.sendChannelEmbed(
         buildErrorEmbed(

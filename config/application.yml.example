@@ -17,17 +17,33 @@ plugins:
     allowSearch: true
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
+    # Remote Cipher untuk mendekripsi signature stream YouTube terbaru (WEB / MWEB / TVHTML5_SIMPLY)
+    remoteCipher:
+      url: "https://cipher.kikkia.dev/"
+      userAgent: "LaguKan"
+    # Urutan client fallback (WEB wajib sebelum IOS agar ytsearch tidak kosong)
     clients:
       - MUSIC
-      - ANDROID_VR
       - WEB
+      - MWEB
+      - TVHTML5_SIMPLY
+      - ANDROID_MUSIC
       - WEBEMBEDDED
+      - ANDROID_VR
+      - IOS
+    # Opsional: Jika jaringan seluler (CGNAT 4G) Anda memunculkan "This video requires login"
+    # pada seluruh client di atas, tambahkan "- TV" pada daftar clients dan aktifkan oauth di bawah
+    # menggunakan AKUN GOOGLE CADANGAN (jangan gunakan akun utama):
+    # oauth:
+    #   enabled: true
+    #   # Setelah login 1x di https://www.google.com/device, tempel refreshToken dari log ke bawah ini:
+    #   # refreshToken: "tempel_refresh_token_di_sini"
 
 lavalink:
   plugins:
-    # Plugin resmi YouTube untuk Lavalink v4
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.11.6"
-      snapshot: false
+    # Gunakan snapshot terbaru youtube-plugin yang sudah memperbaiki bug IOS 400 & TV OAuth PS4 User-Agent
+    - dependency: "dev.lavalink.youtube:youtube-plugin:2be8e542d3f6f178e048dca565892684c2e40177"
+      snapshot: true
     # Opsional: Aktifkan LavaSrc di bawah ini jika ingin pencocokan Spotify langsung di sisi Lavalink
     # - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.3.0"
     #   snapshot: false
@@ -76,3 +92,4 @@ logging:
   level:
     root: INFO
     lavalink: INFO
+    dev.lavalink.youtube: INFO

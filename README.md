@@ -338,11 +338,12 @@ Tekan **`Ctrl + B`** lalu **`D`** untuk melepas tampilan `tmux` ke latar belakan
   2. Buka **Pengaturan HP -> Aplikasi -> Termux -> Baterai**, lalu pilih **Tidak Dibatasi (Unrestricted)**.
   3. Pada Android 12+, matikan pembatas proses latar belakang melalui *Wireless Debugging* (`Disable child process restrictions` di Developer Options Android 14+, atau perintah ADB standar Android).
 
-### 5. Bot Masuk ke Voice Channel Tetapi Tidak Ada Suara / Gagal Memutar YouTube
-- **Penyebab:** Plugin `youtube-plugin` pada Lavalink perlu diperbarui ke rilis terbaru, atau bot terkena *Server Mute* di Discord.
+### 5. Bot Masuk ke Voice Channel Tetapi Tidak Ada Suara / Error YouTube (`This video requires login` atau `No supported audio streams available`)
+- **Penyebab:** YouTube mewajibkan dekripsi signature baru pada client `WEB`/`MWEB`/`TVHTML5_SIMPLY` dan terkadang membatasi IP seluler 4G (CGNAT) pada client `ANDROID_VR`.
 - **Solusi:**
-  1. Periksa versi terbaru `dev.lavalink.youtube:youtube-plugin` di [GitHub Lavalink YouTube Plugin](https://github.com/lavalink-devs/youtube-source/releases), perbarui nomor versinya di `application.yml`, lalu restart Lavalink.
-  2. Pastikan bot memiliki izin `Connect` dan `Speak` (dan menjadi *Speaker* jika berada di Stage Channel).
+  1. Pastikan `application.yml` menggunakan `youtube-plugin:1.18.2` (atau terbaru) serta menyertakan blok `remoteCipher` (`https://cipher.kikkia.dev/`) dan urutan `clients` lengkap seperti pada `config/application.yml.example`.
+  2. Jika seluruh client tanpa login tetap terkena `This video requires login` akibat IP operator seluler, tambahkan `- TV` pada `clients:` dan aktifkan `oauth: enabled: true` di `application.yml` menggunakan **akun Google cadangan** (bukan akun utama), lalu masukkan kode yang muncul di log Lavalink ke `https://www.google.com/device`.
+  3. LaguKan juga otomatis mengalihkan lagu yang gagal dimuat dari YouTube ke **SoundCloud fallback** agar suara tetap berputar.
 
 ### 6. Error Token Discord Tidak Valid (`TokenInvalid`)
 - **Penyebab:** Terdapat spasi berlebih atau tanda kutip yang salah saat menyalin `DISCORD_TOKEN` ke `.env`.
