@@ -28,6 +28,9 @@ Lavalink.jar
 application.yml
 plugins/
 
+# Local Pre-Edit Backups
+.backups/
+
 # OS & Editor
 .DS_Store
 Thumbs.db

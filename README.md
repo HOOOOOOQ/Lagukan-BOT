@@ -61,12 +61,13 @@ LaguKan/
 │   │   ├── queue/                   # queue, shuffle, loop, remove, clear, move, jump, replay
 │   │   ├── voice/                   # join, disconnect, 247, autoplay
 │   │   ├── utility/                 # lyrics, filter, playlist, saveplaylist, loadplaylist, dj
-│   │   └── information/             # help, ping, botinfo, serverinfo, stats
+│   │   └── information/             # help, ping, botinfo, serverinfo, stats, debugmusic
 │   ├── music/
 │   │   ├── playerManager.js         # Manajer sesi pemutar musik per-guild & pemulihan
 │   │   ├── queueManager.js          # Manajer antrean & riwayat lagu per-guild
-│   │   ├── sourceResolver.js        # Multi-source resolver & pencocokan metadata Spotify
-│   │   ├── musicPlayer.js           # Kontroler Shoukaku Player, filter, & sinkronisasi Embed
+│   │   ├── sourceResolver.js        # Multi-source resolver, fallback & pencocokan metadata Spotify
+│   │   ├── musicPlayer.js           # Kontroler Shoukaku Player, TrackStart gate & sinkronisasi Embed
+│   │   ├── audioDiagnostics.js      # Diagnostik 9-tahap pipeline suara & deteksi decoder ARM64
 │   │   ├── autoplay.js              # Mesin rekomendasi lagu otomatis anti-duplikat
 │   │   └── filters.js               # Preset efek filter audio Lavalink v4
 │   ├── buttons/
@@ -91,13 +92,14 @@ LaguKan/
 ├── logs/                            # Lokasi file log runtime (lagukan.log)
 ├── scripts/
 │   ├── checkSyntax.js               # Pemeriksa syntax & validasi seluruh modul
-│   └── termux-setup.sh              # Script bantu instalasi cepat Android Termux
+│   ├── termux-setup.sh              # Script bantu instalasi cepat Android Termux
+│   └── start-lavalink-termux.sh     # Launcher Lavalink ARM64 Termux (Pure-Java Opus / glibc)
 └── tests/                           # Pengujian otomatis unit & integrasi (node --test)
 ```
 
 ---
 
-## 📋 Daftar Lengkap Slash Commands (33 Perintah)
+## 📋 Daftar Lengkap Slash Commands (34 Perintah)
 
 | Kategori | Perintah | Fungsi |
 | :--- | :--- | :--- |
@@ -134,6 +136,7 @@ LaguKan/
 | | `/botinfo` | Menampilkan identitas bot (`LaguKan`), developer (`666pallxXx`), & versi library |
 | | `/serverinfo` | Menampilkan detail server Discord beserta konfigurasi musik aktif |
 | | `/stats` | Menampilkan penggunaan RAM, CPU, uptime, & kesehatan node Lavalink |
+| | `/debugmusic [publik]` | Diagnostik teknis lengkap pipa audio, versi Lavalink/Java/Node, YouTube clients, decoder ARM64, & error track |
 
 ---
 
@@ -209,30 +212,31 @@ npm install
 
 *(Atau cukup jalankan script otomatis: `bash scripts/termux-setup.sh`).*
 
-### 3. Menyiapkan & Menjalankan Server Lavalink v4
+### 3. Menyiapkan & Menjalankan Server Lavalink v4 di Android Termux ARM64
 
-Karena **Lavalink membutuhkan proses Java terpisah**, ikuti langkah berikut apabila Anda ingin menjalankan Lavalink langsung di dalam Termux:
+Karena **Lavalink membutuhkan proses Java terpisah**, perhatikan arsitektur Android Termux ARM64:
+- File `Lavalink.jar` menyertakan library native JNI Linux ARM64 (`libconnector.so` untuk `AacDecoderLibrary` / `OpusDecoder` serta `libdave-jvm.so` untuk enkripsi suara Discord DAVE) yang dikompilasi untuk **GNU `glibc`**, sedangkan Termux standar menggunakan **Android Bionic `libc`**.
+- **LaguKan** mendukung **dua lapisan perlindungan sekaligus**:
+  1. **Pure-Java Opus Passthrough (`DEFAULT_VOLUME=100` + Client Opus `ANDROID_VR` / `ANDROID_MUSIC` / `TVHTML5_SIMPLY` + SoundCloud Ogg Opus):** Meneruskan paket Opus langsung ke Discord tanpa memanggil `AacDecoderLibrary`.
+  2. **Runtime `proot-distro` Debian ARM64 (`glibc`) Tanpa Root di Termux (Direkomendasikan):** Membuat seluruh decoder native ARM64 (`AacDecoderLibrary`, `OpusDecoder`, filter audio, `TV` OAuth, dan `libdave-jvm`) berjalan 100% kompatibel tanpa Docker dan tanpa root!
+
+Jalankan perintah otomatis berikut dari folder `~/Lagukan-BOT`:
 
 ```bash
+cd ~/Lagukan-BOT
+
+# Siapkan runtime Linux ARM64 (glibc + OpenJDK 21) di dalam Termux (cukup 1x saja)
+./scripts/start-lavalink-termux.sh --setup-glibc
+
+# Edit password Lavalink (pastikan sama persis dengan LAVALINK_PASSWORD di .env)
 mkdir -p ~/lavalink
-cd ~/lavalink
-
-# Unduh Lavalink v4 resmi terbaru dari GitHub Releases
-curl -L -o Lavalink.jar https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar
-
-# Salin contoh konfigurasi Lavalink dari folder LaguKan
 cp ~/Lagukan-BOT/config/application.yml.example ~/lavalink/application.yml
-
-# Edit password di dalam application.yml (ganti GANTI_DENGAN_PASSWORD_KUAT_ANDA)
 nano ~/lavalink/application.yml
-```
 
-Jalankan Lavalink di latar belakang menggunakan **tmux** (dengan batas RAM ringan `-Xmx512M` agar ramah perangkat Android):
-
-```bash
+# Jalankan Lavalink di sesi tmux khusus
 tmux new -s lavalink
-cd ~/lavalink
-java -Xmx512M -jar Lavalink.jar
+cd ~/Lagukan-BOT
+./scripts/start-lavalink-termux.sh
 ```
 
 Setelah muncul tulisan **`Lavalink is ready to accept connections`**, tekan kombinasi tombol **`Ctrl + B`** lalu lepas dan tekan **`D`** untuk keluar dari layar `tmux` tanpa mematikan Lavalink!
@@ -269,7 +273,7 @@ Simpan file di `nano` dengan menekan **`Ctrl + O` -> `Enter` -> `Ctrl + X`**.
 
 ### 5. Periksa Syntax & Daftarkan Slash Commands ke Discord
 
-Sebelum menyalakan bot untuk pertama kali, periksa integritas kode dan daftarkan seluruh 33 Slash Command:
+Sebelum menyalakan bot untuk pertama kali, periksa integritas kode dan daftarkan seluruh 34 Slash Command:
 
 ```bash
 npm run check
@@ -338,12 +342,16 @@ Tekan **`Ctrl + B`** lalu **`D`** untuk melepas tampilan `tmux` ke latar belakan
   2. Buka **Pengaturan HP -> Aplikasi -> Termux -> Baterai**, lalu pilih **Tidak Dibatasi (Unrestricted)**.
   3. Pada Android 12+, matikan pembatas proses latar belakang melalui *Wireless Debugging* (`Disable child process restrictions` di Developer Options Android 14+, atau perintah ADB standar Android).
 
-### 5. Bot Masuk ke Voice Channel Tetapi Tidak Ada Suara / Error YouTube (`This video requires login` atau `No supported audio streams available`)
-- **Penyebab:** YouTube mewajibkan dekripsi signature baru pada client `WEB`/`MWEB`/`TVHTML5_SIMPLY` dan terkadang membatasi IP seluler 4G (CGNAT) pada client `ANDROID_VR`.
-- **Solusi:**
-  1. Pastikan `application.yml` menggunakan `youtube-plugin:1.18.2` (atau terbaru) serta menyertakan blok `remoteCipher` (`https://cipher.kikkia.dev/`) dan urutan `clients` lengkap seperti pada `config/application.yml.example`.
-  2. Jika seluruh client tanpa login tetap terkena `This video requires login` akibat IP operator seluler, tambahkan `- TV` pada `clients:` dan aktifkan `oauth: enabled: true` di `application.yml` menggunakan **akun Google cadangan** (bukan akun utama), lalu masukkan kode yang muncul di log Lavalink ke `https://www.google.com/device`.
-  3. LaguKan juga otomatis mengalihkan lagu yang gagal dimuat dari YouTube ke **SoundCloud fallback** agar suara tetap berputar.
+### 5. Error `AacDecoderLibrary.getInstance()` / `NativeLibraryLoader.load()` / `No supported audio streams available`
+- **Penyebab Teknis:**
+  1. Java bawaan Termux menggunakan **Android Bionic `libc`**, sedangkan library native di dalam `Lavalink.jar` (`libconnector.so` milik `AacDecoderLibrary` & `OpusDecoder`, serta `libdave-jvm.so`) dikompilasi untuk **GNU `glibc` (`libc.so.6`, `libgcc_s.so.1`)**.
+  2. Client YouTube `IOS` dan `TV` (PS4 Safari UA) hanya mengembalikan audio **MP4/AAC** (bukan WebM Opus), sehingga selalu memicu `AacDecoderLibrary.getInstance()`. Selain itu, jika `DEFAULT_VOLUME` bukan `100`, Lavaplayer memaksa transcoding via JNI `OpusDecoder`.
+  3. Client `WEB` tanpa PoToken dibatasi oleh protokol SABR YouTube (`No supported audio streams available`).
+- **Solusi Tuntas di Android Termux ARM64:**
+  1. Salin ulang `config/application.yml.example` terbaru ke `~/lavalink/application.yml` (sudah memprioritaskan client Opus `ANDROID_VR`, `ANDROID_MUSIC`, `TVHTML5_SIMPLY`, menghapus `IOS`, dan menyetel `bufferDurationMs: 0`) serta hapus JAR plugin lama di `~/lavalink/plugins/*` sebelum menyalakan ulang Lavalink.
+  2. Pastikan `DEFAULT_VOLUME=100` pada `.env` agar **Pure-Java Opus Passthrough** aktif.
+  3. Jalankan `./scripts/start-lavalink-termux.sh --setup-glibc` satu kali lalu nyalakan Lavalink via `./scripts/start-lavalink-termux.sh` agar seluruh decoder native ARM64 (`AAC`, `Opus`, `Filter`, dan `libdave`) berjalan mulus tanpa error JNI.
+  4. Gunakan perintah `/debugmusic` di Discord kapan saja untuk memeriksa status koneksi, client YouTube aktif, status decoder ARM64, dan riwayat error track secara langsung.
 
 ### 6. Error Token Discord Tidak Valid (`TokenInvalid`)
 - **Penyebab:** Terdapat spasi berlebih atau tanda kutip yang salah saat menyalin `DISCORD_TOKEN` ke `.env`.

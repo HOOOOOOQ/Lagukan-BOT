@@ -13,6 +13,30 @@ module.exports = {
       logger.info(
         `✅ Node Lavalink "${name}" terhubung! (lavalinkResume=${lavalinkResume}, libraryResume=${libraryResume})`
       );
+      if (client.audioDiagnostics) {
+        client.audioDiagnostics.clearNodeNativeStatus(name);
+      }
+
+      const connectedNode = shoukaku.nodes.get(name);
+      if (connectedNode?.rest && typeof connectedNode.rest.getLavalinkInfo === 'function') {
+        connectedNode.rest
+          .getLavalinkInfo()
+          .then((info) => {
+            if (info) {
+              connectedNode.info = info;
+              const pluginSummary = (info.plugins || [])
+                .map((p) => `${p.name}@${p.version}`)
+                .join(', ') || 'tanpa plugin eksternal';
+              logger.info(
+                `📦 Info Lavalink "${name}": v${info.version?.semver || '4.x'} | Java ${info.jvm || 'unknown'} | Lavaplayer ${info.lavaplayer || 'unknown'} | Plugins: ${pluginSummary}`
+              );
+            }
+          })
+          .catch((err) => {
+            logger.debug(`Gagal mengambil /v4/info awal dari node "${name}": ${err.message}`);
+          });
+      }
+
       try {
         await client.playerManager.recoverInterruptedPlayers();
         await client.playerManager.restoreTwentyFourSevenSessions();
