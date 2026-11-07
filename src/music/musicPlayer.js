@@ -15,7 +15,7 @@ const { config } = require('../../config/config');
 class MusicPlayer {
   /**
    * @param {object} options
-   * @param {import('../client')} options.client
+   * @param {import('../client').LaguKanClient} options.client
    * @param {import('./playerManager').PlayerManager} options.manager
    * @param {string} options.guildId
    * @param {string} options.voiceChannelId
@@ -35,6 +35,8 @@ class MusicPlayer {
     this.currentTrack = null;
     this.paused = false;
     this.playing = false;
+    this.trackStarted = false;
+    this.state = 'IDLE';
     this.destroyed = false;
 
     this.volume = Number(guildSettings?.default_volume ?? config.music.defaultVolume);
@@ -48,6 +50,10 @@ class MusicPlayer {
     this.lastPositionTimestamp = 0;
     this.consecutiveFailures = 0;
     this.suppressEndHandling = false;
+    this.lastException = null;
+
+    /** @type {Array<{ resolve: Function, timer: NodeJS.Timeout }>} */
+    this._pendingStartWaiters = [];
 
     /** @type {import('discord.js').Message | null} */
     this.playerMessage = null;
@@ -57,6 +63,18 @@ class MusicPlayer {
     this.updatingMessage = false;
 
     this.bindPlayerEvents(this.player);
+  }
+
+  /**
+   * Menentukan apakah player terhubung ke sesi WebSocket Lavalink nyata (asynchronous TrackStartEvent)
+   * atau mock sinkron pada pengujian unit ringan.
+   */
+  isAsyncLavalinkSession() {
+    return Boolean(
+      this.player?.node?.ws ||
+      this.player?.node?.sessionId ||
+      this.player?._asyncLifecycle
+    );
   }
 
   bindPlayerEvents(shoukakuPlayer) {
@@ -95,13 +113,50 @@ class MusicPlayer {
   }
 
   attachNewShoukakuPlayer(newShoukakuPlayer) {
+    if (this.player && this.player !== newShoukakuPlayer) {
+      this.player.removeAllListeners();
+    }
     this.player = newShoukakuPlayer;
     this.bindPlayerEvents(newShoukakuPlayer);
   }
 
+  _registerStartWaiter(timeoutMs = config.music.trackStartTimeoutMs) {
+    return new Promise((resolve) => {
+      const waiter = {
+        resolve,
+        timer: setTimeout(() => {
+          this._pendingStartWaiters = this._pendingStartWaiters.filter((w) => w !== waiter);
+          resolve({
+            started: this.trackStarted,
+            timedOut: !this.trackStarted,
+            track: this.currentTrack,
+            diagnosis: this.lastException?.diagnosis || null
+          });
+        }, timeoutMs)
+      };
+      if (typeof waiter.timer.unref === 'function') {
+        waiter.timer.unref();
+      }
+      this._pendingStartWaiters.push(waiter);
+    });
+  }
+
+  _resolvePendingStartWaiters(result) {
+    if (!this._pendingStartWaiters.length) return;
+    const waiters = this._pendingStartWaiters.splice(0, this._pendingStartWaiters.length);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      try {
+        waiter.resolve(result);
+      } catch {
+        // Abaikan
+      }
+    }
+  }
+
   getCurrentPosition() {
     if (!this.currentTrack) return 0;
-    if (this.paused || !this.lastPositionTimestamp) {
+    if (this.paused || !this.trackStarted || !this.lastPositionTimestamp) {
       return this.lastPosition;
     }
     const preset = getFilterPreset(this.activeFilterKey);
@@ -155,7 +210,7 @@ class MusicPlayer {
   startRefreshLoop() {
     this.stopRefreshLoop();
     this.refreshInterval = setInterval(() => {
-      if (this.destroyed || this.paused || !this.playing || !this.currentTrack) return;
+      if (this.destroyed || this.paused || !this.playing || !this.trackStarted || !this.currentTrack) return;
       this.updatePlayerMessage().catch(() => {});
     }, config.music.playerRefreshIntervalMs);
     if (typeof this.refreshInterval.unref === 'function') {
@@ -238,6 +293,9 @@ class MusicPlayer {
   }
 
   async sendFreshPlayerMessage() {
+    // JANGAN PERNAH mengirim panel Now Playing sebelum track benar-benar mulai diputar!
+    if (!this.currentTrack || !this.trackStarted) return null;
+
     await this.disableOldPlayerMessage();
     const channel = await this.getTextChannel();
     if (!channel || typeof channel.send !== 'function') return null;
@@ -257,7 +315,7 @@ class MusicPlayer {
     this.updatingMessage = true;
     try {
       if (!this.playerMessage) {
-        if (!options.ended && this.currentTrack) {
+        if (!options.ended && this.currentTrack && this.trackStarted) {
           await this.sendFreshPlayerMessage();
         }
         return;
@@ -282,9 +340,16 @@ class MusicPlayer {
 
   /**
    * Memulai pemutaran satu lagu spesifik pada Lavalink.
+   * Mendukung mode waitForStart agar perintah /play dapat menunggu konfirmasi nyata TrackStartEvent
+   * (serta menangani fallback otomatis apabila track pertama gagal didekode).
    */
-  async playSpecificTrack(track, { startPositionMs = 0 } = {}) {
-    if (this.destroyed || !track) return;
+  async playSpecificTrack(
+    track,
+    { startPositionMs = 0, waitForStart = false, preserveWaiters = false } = {}
+  ) {
+    if (this.destroyed || !track) {
+      return { started: false, cancelled: true };
+    }
     this.clearIdleTimer();
 
     const resolvedTrack = await this.client.sourceResolver.ensureTrackResolved(
@@ -299,11 +364,42 @@ class MusicPlayer {
       );
     }
 
+    // Jika node Lavalink terdeteksi berjalan pada Android Bionic tanpa decoder JNI glibc,
+    // pastikan volume dikunci ke 100% dan filter dinonaktifkan agar Pure-Java Opus Passthrough bekerja.
+    const nodeName = this.player?.node?.name;
+    if (this.client.audioDiagnostics?.isNativeDecoderBroken(nodeName)) {
+      if (this.volume !== config.music.opusPassthroughVolume) {
+        this.volume = config.music.opusPassthroughVolume;
+      }
+      if (this.activeFilterKey !== 'off') {
+        this.activeFilterKey = 'off';
+        this.activeFilterLabel = 'Normal';
+        await this.player.clearFilters().catch(() => {});
+      }
+    }
+
     this.currentTrack = resolvedTrack;
     this.paused = false;
     this.playing = true;
+    this.trackStarted = false;
+    this.state = resolvedTrack.fallbackFrom ? 'FALLBACK' : 'LOADING';
+    this.lastException = null;
     this.lastPosition = startPositionMs;
     this.lastPositionTimestamp = Date.now();
+
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordStage(
+        this.guildId,
+        7,
+        'Memuat & Mendekode Stream Audio di Lavalink',
+        `judul="${resolvedTrack.info.title}", sumber=${resolvedTrack.info.sourceName}, vol=${this.volume}%, filter=${this.activeFilterKey}`
+      );
+    }
+
+    let startPromise = null;
+    if (waitForStart && !preserveWaiters) {
+      startPromise = this._registerStartWaiter(config.music.trackStartTimeoutMs);
+    }
 
     const playPayload = {
       track: { encoded: resolvedTrack.encoded },
@@ -314,7 +410,25 @@ class MusicPlayer {
       playPayload.position = startPositionMs;
     }
 
-    await this.player.playTrack(playPayload);
+    try {
+      await this.player.playTrack(playPayload);
+    } catch (err) {
+      if (this.client.audioDiagnostics) {
+        this.client.audioDiagnostics.recordTrackError({
+          guildId: this.guildId,
+          nodeName,
+          track: resolvedTrack,
+          stage: 'PLAY_REST',
+          rawException: err
+        });
+      }
+      this.currentTrack = null;
+      this.playing = false;
+      this.trackStarted = false;
+      this.state = 'IDLE';
+      this._resolvePendingStartWaiters({ started: false, error: err });
+      throw err;
+    }
 
     // Pra-muat lagu berikutnya di latar belakang jika berupa lagu deferred (misal dari album Spotify)
     const upcoming = this.queue.peek();
@@ -328,22 +442,52 @@ class MusicPlayer {
         })
         .catch(() => {});
     }
+
+    // Untuk stub sinkron di unit test tanpa sesi WebSocket Lavalink nyata
+    if (!this.isAsyncLavalinkSession()) {
+      this.trackStarted = true;
+      this.state = 'PLAYING';
+      this._resolvePendingStartWaiters({
+        started: true,
+        track: this.currentTrack,
+        usedFallback: Boolean(this.currentTrack?.fallbackFrom)
+      });
+    }
+
+    if (startPromise) {
+      return await startPromise;
+    }
+
+    return {
+      started: this.trackStarted,
+      track: this.currentTrack,
+      usedFallback: Boolean(this.currentTrack?.fallbackFrom)
+    };
   }
 
   /**
    * Memulai pemutaran jika belum ada lagu yang sedang berjalan.
    */
-  async playIfIdle() {
+  async playIfIdle({ waitForStart = false } = {}) {
     if (this.playing && this.currentTrack) {
       await this.updatePlayerMessage();
+      if (waitForStart) {
+        return {
+          alreadyPlaying: true,
+          started: this.trackStarted,
+          track: this.currentTrack
+        };
+      }
       return false;
     }
 
     const next = this.queue.dequeueNext(null);
-    if (!next) return false;
+    if (!next) {
+      return waitForStart ? { started: false, empty: true } : false;
+    }
 
-    await this.playSpecificTrack(next);
-    return true;
+    const res = await this.playSpecificTrack(next, { waitForStart });
+    return waitForStart ? res : true;
   }
 
   /**
@@ -364,6 +508,8 @@ class MusicPlayer {
       this.currentTrack = null;
       this.playing = false;
       this.paused = false;
+      this.trackStarted = false;
+      this.state = 'IDLE';
       this.lastPosition = 0;
       this.lastPositionTimestamp = 0;
       this.stopRefreshLoop();
@@ -395,6 +541,8 @@ class MusicPlayer {
       }
       this.currentTrack = null;
       this.playing = false;
+      this.trackStarted = false;
+      this.state = 'IDLE';
       this.stopRefreshLoop();
       await this.updatePlayerMessage({ ended: true });
       this.startIdleTimer();
@@ -406,7 +554,31 @@ class MusicPlayer {
     this.consecutiveFailures = 0;
     this.playing = true;
     this.paused = false;
+    this.trackStarted = true;
+    this.state = 'PLAYING';
     this.lastPositionTimestamp = Date.now();
+
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordStage(
+        this.guildId,
+        8,
+        'Transmisi Audio ke Discord Voice Gateway Aktif',
+        `judul="${this.currentTrack?.info?.title || 'Lagu'}"`
+      );
+      this.client.audioDiagnostics.recordStage(
+        this.guildId,
+        9,
+        'Panel Now Playing Aktif Ditampilkan',
+        `judul="${this.currentTrack?.info?.title || 'Lagu'}" [${this.currentTrack?.info?.sourceName || 'audio'}]`
+      );
+    }
+
+    this._resolvePendingStartWaiters({
+      started: true,
+      track: this.currentTrack,
+      usedFallback: Boolean(this.currentTrack?.fallbackFrom)
+    });
+
     await this.sendFreshPlayerMessage();
     this.startRefreshLoop();
   }
@@ -429,23 +601,109 @@ class MusicPlayer {
     }
 
     if (reason === 'loadFailed') {
+      const failedTrack = this.currentTrack;
+      const lastExc = this.lastException;
+
+      // 1. Self-Healing Retry: jika gagal semata karena volume != 100 atau filter memicu JNI OpusDecoder
+      //    pada Android Bionic, coba ulangi track yang sama 1x pada Volume 100% (Pure-Java Opus Passthrough)
+      if (
+        failedTrack &&
+        !failedTrack._retriedAtSafeVolume &&
+        lastExc?.diagnosis?.code === 'ANDROID_JNI_DECODER_UNSUPPORTED' &&
+        lastExc.hadNonPassthroughSettings &&
+        this.player?.node
+      ) {
+        failedTrack._retriedAtSafeVolume = true;
+        logger.info(
+          `[Self-Heal][Guild ${this.guildId}] Mengulangi "${failedTrack.info?.title}" pada Volume 100% tanpa filter (Pure-Java Opus Passthrough).`
+        );
+        try {
+          await this.playSpecificTrack(failedTrack, { preserveWaiters: true });
+          return;
+        } catch (retryErr) {
+          logger.warn(`[Self-Heal][Guild ${this.guildId}] Percobaan ulang safe-volume gagal: ${retryErr.message}`);
+        }
+      }
+
+      // 2. Bounded Multi-Source Fallback (YouTube/YTMusic -> SoundCloud Ogg Opus -> alternatif non-live)
+      if (failedTrack && this.player?.node) {
+        let fallbackTrack = null;
+        if (typeof this.client.sourceResolver?.findFallbackTrack === 'function') {
+          fallbackTrack = await this.client.sourceResolver.findFallbackTrack(
+            this.player.node,
+            failedTrack
+          );
+        } else if (
+          !failedTrack._retriedViaSoundCloud &&
+          typeof this.client.sourceResolver?.findSoundCloudFallback === 'function'
+        ) {
+          fallbackTrack = await this.client.sourceResolver.findSoundCloudFallback(
+            this.player.node,
+            failedTrack
+          );
+        }
+
+        if (fallbackTrack?.encoded) {
+          logger.info(
+            `[Fallback][Guild ${this.guildId}] Mengalihkan "${failedTrack.info?.title}" (${failedTrack.info?.sourceName}) -> "${fallbackTrack.info?.title}" (${fallbackTrack.info?.sourceName}).`
+          );
+          try {
+            await this.playSpecificTrack(fallbackTrack, { preserveWaiters: true });
+            return;
+          } catch (fbErr) {
+            logger.warn(`[Fallback][Guild ${this.guildId}] Gagal memulai track fallback: ${fbErr.message}`);
+          }
+        }
+      }
+
+      // 3. Seluruh sumber untuk lagu ini gagal — JANGAN kirim Now Playing palsu & JANGAN loop tak terbatas
+      const diagnosis =
+        lastExc?.diagnosis ||
+        (this.client.audioDiagnostics
+          ? this.client.audioDiagnostics.recordTrackError({
+              guildId: this.guildId,
+              nodeName: this.player?.node?.name,
+              track: failedTrack,
+              stage: 'LOAD_FAILED',
+              rawException: 'Track ended with reason: loadFailed'
+            })
+          : null);
+
       this.consecutiveFailures += 1;
-      const failedTitle = this.currentTrack?.info?.title || 'Lagu';
-      logger.warn(`[Guild ${this.guildId}] Track loadFailed: ${failedTitle}`);
-      await this.sendChannelEmbed(
-        buildErrorEmbed(
-          'Pemutaran Lagu Gagal',
-          `Sumber audio untuk **${failedTitle}** gagal dimuat oleh Lavalink.`
-        )
-      );
-      if (this.consecutiveFailures >= 3) {
+      const failedTitle = failedTrack?.info?.title || 'Lagu';
+      const detailedReason =
+        diagnosis?.userMessage ||
+        `Sumber audio untuk **${failedTitle}** gagal dimuat atau didekode oleh server Lavalink.`;
+
+      logger.warn(`[Guild ${this.guildId}] Track loadFailed setelah fallback: ${failedTitle} (${diagnosis?.code || 'UNKNOWN'})`);
+
+      const hadInteractiveWaiter = this._pendingStartWaiters.length > 0;
+      this._resolvePendingStartWaiters({
+        started: false,
+        failedTrack,
+        diagnosis
+      });
+
+      if (!hadInteractiveWaiter) {
+        await this.sendChannelEmbed(
+          buildErrorEmbed(
+            'Pemutaran Lagu Gagal',
+            `**${failedTitle}** tidak dapat diputar.\n${detailedReason}`
+          )
+        );
+      }
+
+      if (this.consecutiveFailures >= 3 || this.queue.isEmpty) {
         this.currentTrack = null;
         this.playing = false;
+        this.trackStarted = false;
+        this.state = 'IDLE';
         this.stopRefreshLoop();
         await this.updatePlayerMessage({ ended: true });
         this.startIdleTimer();
         return;
       }
+
       await this.advanceQueue({ skipped: true });
       return;
     }
@@ -455,12 +713,56 @@ class MusicPlayer {
   }
 
   async onTrackException(event) {
-    const msg = event?.exception?.message || 'Kesalahan dekode audio';
-    logger.warn(`[Guild ${this.guildId}] TrackException: ${msg}`);
+    const rawExc = event?.exception || event;
+    const hadNonPassthroughSettings =
+      this.volume !== config.music.opusPassthroughVolume || this.activeFilterKey !== 'off';
+
+    let diagnosis = null;
+    if (this.client.audioDiagnostics) {
+      diagnosis = this.client.audioDiagnostics.recordTrackError({
+        guildId: this.guildId,
+        nodeName: this.player?.node?.name,
+        track: this.currentTrack,
+        stage: 'DECODE_EXCEPTION',
+        rawException: rawExc
+      });
+    }
+
+    this.lastException = {
+      diagnosis,
+      raw: rawExc,
+      hadNonPassthroughSettings,
+      at: Date.now()
+    };
+
+    const msg = rawExc?.message || rawExc?.cause || 'Kesalahan dekode audio';
+    logger.warn(
+      `[Guild ${this.guildId}] TrackException [${diagnosis?.code || 'ERROR'}]: ${msg}${
+        rawExc?.cause ? ` | Cause: ${rawExc.cause}` : ''
+      }`
+    );
+
+    // Self-heal otomatis untuk lingkungan Android Termux Bionic tanpa decoder JNI glibc
+    if (diagnosis?.isNativeJniFailure && hadNonPassthroughSettings) {
+      this.volume = config.music.opusPassthroughVolume;
+      this.activeFilterKey = 'off';
+      this.activeFilterLabel = 'Normal';
+      await this.player.clearFilters().catch(() => {});
+      await this.player.setGlobalVolume(config.music.opusPassthroughVolume).catch(() => {});
+    }
   }
 
   async onTrackStuck(event) {
     logger.warn(`[Guild ${this.guildId}] TrackStuck (${event?.thresholdMs}ms), melewati otomatis.`);
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordTrackError({
+        guildId: this.guildId,
+        nodeName: this.player?.node?.name,
+        track: this.currentTrack,
+        stage: 'TRACK_STUCK',
+        rawException: `Audio stream stuck > ${event?.thresholdMs || 10000}ms`
+      });
+    }
     await this.sendChannelEmbed(
       buildErrorEmbed(
         'Aliran Audio Macet (Stuck)',
@@ -471,11 +773,24 @@ class MusicPlayer {
   }
 
   async onWebSocketClosed(event) {
+    const code = event?.code;
+    const reason = event?.reason || 'unknown';
     logger.warn(
-      `[Guild ${this.guildId}] Voice WebSocket tertutup (code=${event?.code}, reason=${event?.reason || 'unknown'})`
+      `[Guild ${this.guildId}] Voice WebSocket tertutup (code=${code}, reason=${reason})`
     );
+
+    if (code === 4017 && this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordTrackError({
+        guildId: this.guildId,
+        nodeName: this.player?.node?.name,
+        track: this.currentTrack,
+        stage: 'VOICE_GATEWAY_DAVE',
+        rawException: `Discord Voice Close 4017 (DAVE E2EE libdave-jvm): ${reason}`
+      });
+    }
+
     // Code 4014 = Disconnected / Channel deleted / Kicked
-    if (event?.code === 4014 && !this.twentyFourSeven) {
+    if (code === 4014 && !this.twentyFourSeven) {
       await this.manager.destroy(this.guildId, { skipLeave: true });
     }
   }
@@ -498,6 +813,7 @@ class MusicPlayer {
     this.lastPositionTimestamp = Date.now();
     await this.player.setPaused(true);
     this.paused = true;
+    this.state = 'PAUSED';
     await this.updatePlayerMessage();
   }
 
@@ -516,6 +832,7 @@ class MusicPlayer {
     this.lastPositionTimestamp = Date.now();
     await this.player.setPaused(false);
     this.paused = false;
+    this.state = this.trackStarted ? 'PLAYING' : 'LOADING';
     await this.updatePlayerMessage();
   }
 
@@ -587,6 +904,18 @@ class MusicPlayer {
   }
 
   async setVolume(newVolume) {
+    const nodeName = this.player?.node?.name;
+    if (
+      this.client.audioDiagnostics?.isNativeDecoderBroken(nodeName) &&
+      Math.round(Number(newVolume)) !== config.music.opusPassthroughVolume
+    ) {
+      throw new AppError(
+        ErrorCodes.VALIDATION_ERROR,
+        `Server Lavalink Anda saat ini berjalan di Android Bionic tanpa decoder native \`glibc\`, sehingga volume dikunci pada **100%** agar **Pure-Java Opus Passthrough** tetap mengeluarkan suara jernih. Untuk mengaktifkan pengatur volume bebas, jalankan Lavalink melalui \`./scripts/start-lavalink-termux.sh\`.`,
+        { isWarning: true }
+      );
+    }
+
     const clamped = Math.max(
       config.music.minVolume,
       Math.min(config.music.maxVolume, Math.round(Number(newVolume)))
@@ -603,6 +932,18 @@ class MusicPlayer {
       throw new AppError(ErrorCodes.VALIDATION_ERROR, 'Preset filter audio tidak dikenali.', {
         isWarning: true
       });
+    }
+
+    const nodeName = this.player?.node?.name;
+    if (
+      preset.key !== 'off' &&
+      this.client.audioDiagnostics?.isNativeDecoderBroken(nodeName)
+    ) {
+      throw new AppError(
+        ErrorCodes.VALIDATION_ERROR,
+        `Efek filter DSP membutuhkan decoder native \`glibc\` (\`libconnector.so\`). Saat ini Lavalink berjalan dalam mode **Pure-Java Opus Passthrough** di Android Bionic. Jalankan Lavalink menggunakan \`./scripts/start-lavalink-termux.sh\` untuk mengaktifkan filter audio.`,
+        { isWarning: true }
+      );
     }
 
     this.lastPosition = this.getCurrentPosition();
@@ -626,9 +967,12 @@ class MusicPlayer {
     this.currentTrack = null;
     this.playing = false;
     this.paused = false;
+    this.trackStarted = false;
+    this.state = 'STOPPED';
     this.lastPosition = 0;
     this.lastPositionTimestamp = 0;
     this.stopRefreshLoop();
+    this._resolvePendingStartWaiters({ started: false, cancelled: true });
 
     if (hadTrack && this.player) {
       this.suppressEndHandling = true;
@@ -642,14 +986,17 @@ class MusicPlayer {
       return { stayedInChannel: false };
     }
 
+    this.state = 'IDLE';
     return { stayedInChannel: true };
   }
 
   cleanupTimersAndListeners() {
     this.destroyed = true;
+    this.state = 'DESTROYED';
     this.stopRefreshLoop();
     this.clearIdleTimer();
     this.clearEmptyChannelTimer();
+    this._resolvePendingStartWaiters({ started: false, cancelled: true });
     if (this.player) {
       this.player.removeAllListeners();
     }

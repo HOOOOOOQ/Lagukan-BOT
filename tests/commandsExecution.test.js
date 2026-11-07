@@ -250,10 +250,11 @@ test('End-to-end eksekusi seluruh Slash Command Playback, Queue, Voice, Utility,
     await run('dj', { _sub: 'mode', status: 'on' });
     await run('dj', { _sub: 'reset' });
 
-    // 7. /ping, /serverinfo, /stats, /stop, /disconnect
+    // 7. /ping, /serverinfo, /stats, /debugmusic, /stop, /disconnect
     await run('ping');
     await run('serverinfo');
     await run('stats');
+    await run('debugmusic');
     await run('stop');
 
     await run('join', {}, false);

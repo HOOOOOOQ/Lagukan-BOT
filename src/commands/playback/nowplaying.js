@@ -1,7 +1,7 @@
 'use strict';
 
-const { SlashCommandBuilder } = require('discord.js');
-const { buildMusicPlayerPayload } = require('../../utils/embeds');
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { buildMusicPlayerPayload, buildInfoEmbed } = require('../../utils/embeds');
 const { AppError, ErrorCodes } = require('../../utils/errorHandler');
 
 module.exports = {
@@ -18,6 +18,18 @@ module.exports = {
         'Saat ini tidak ada lagu yang sedang diputar di server ini.',
         { isWarning: true }
       );
+    }
+
+    if (!musicPlayer.trackStarted) {
+      return interaction.reply({
+        embeds: [
+          buildInfoEmbed(
+            'Memuat Aliran Audio...',
+            `⏳ **${musicPlayer.currentTrack.info.title}** sedang dimuat dan didekode oleh server Lavalink. Panel *Now Playing* akan aktif segera setelah suara benar-benar mulai berputar.`
+          )
+        ],
+        flags: MessageFlags.Ephemeral
+      });
     }
 
     await musicPlayer.disableOldPlayerMessage();

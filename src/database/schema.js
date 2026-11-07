@@ -6,7 +6,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS guild_settings (
   guild_id TEXT PRIMARY KEY,
   prefix TEXT NOT NULL DEFAULT '!',
-  default_volume INTEGER NOT NULL DEFAULT 80,
+  default_volume INTEGER NOT NULL DEFAULT 100,
   dj_enabled INTEGER NOT NULL DEFAULT 0,
   dj_role_id TEXT DEFAULT NULL,
   twenty_four_seven INTEGER NOT NULL DEFAULT 0,

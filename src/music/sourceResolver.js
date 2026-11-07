@@ -204,7 +204,8 @@ function normalizeTrack(rawTrack, requester, overrides = {}) {
 }
 
 class SourceResolver {
-  constructor() {
+  constructor(audioDiagnostics = null) {
+    this.audioDiagnostics = audioDiagnostics;
     this.spotifyToken = null;
     this.spotifyTokenExpiresAt = 0;
   }
@@ -703,6 +704,8 @@ class SourceResolver {
 
   /**
    * Mencari daftar lagu berdasarkan kata kunci untuk /search maupun /play.
+   * Mendukung fallback lintas sumber otomatis (YouTube Music -> YouTube -> SoundCloud)
+   * serta memprioritaskan track non-livestream agar kompatibel dengan stream Opus.
    */
   async searchTracks(node, query, sourcePrefix = config.music.defaultSearchSource, limit = 10, requester = null) {
     if (!node) {
@@ -717,12 +720,37 @@ class SourceResolver {
     );
 
     for (const prefix of fallbackOrder) {
-      const response = await node.rest.resolve(`${prefix}:${query}`);
-      if (response?.loadType === LoadType.SEARCH && Array.isArray(response.data) && response.data.length > 0) {
-        return response.data.slice(0, limit).map((t) => normalizeTrack(t, requester));
-      }
-      if (response?.loadType === LoadType.TRACK && response.data) {
-        return [normalizeTrack(response.data, requester)];
+      try {
+        const response = await node.rest.resolve(`${prefix}:${query}`);
+        if (response?.loadType === LoadType.SEARCH && Array.isArray(response.data) && response.data.length > 0) {
+          // Prioritaskan track vod/reguler dibanding livestream karena livestream YouTube selalu membutuhkan transcoding AAC
+          const nonLive = response.data.filter((t) => !t?.info?.isStream);
+          const ordered = nonLive.length > 0 ? [...nonLive, ...response.data.filter((t) => t?.info?.isStream)] : response.data;
+          return ordered.slice(0, limit).map((t) => normalizeTrack(t, requester));
+        }
+        if (response?.loadType === LoadType.TRACK && response.data) {
+          return [normalizeTrack(response.data, requester)];
+        }
+        if (response?.loadType === LoadType.ERROR && this.audioDiagnostics) {
+          this.audioDiagnostics.recordTrackError({
+            guildId: null,
+            nodeName: node.name,
+            track: { info: { title: query, sourceName: prefix } },
+            stage: 'SEARCH_LOAD',
+            rawException: response.data
+          });
+        }
+      } catch (err) {
+        logger.warn(`Pencarian dengan prefix "${prefix}:" gagal untuk "${query}", mencoba sumber berikutnya: ${err.message}`);
+        if (this.audioDiagnostics) {
+          this.audioDiagnostics.recordTrackError({
+            guildId: null,
+            nodeName: node.name,
+            track: { info: { title: query, sourceName: prefix } },
+            stage: 'SEARCH_REST',
+            rawException: err
+          });
+        }
       }
     }
 
@@ -730,9 +758,159 @@ class SourceResolver {
   }
 
   /**
+   * Membersihkan judul & nama artis dari label video agar pencocokan lintas platform akurat.
+   */
+  buildCleanSearchQuery(trackInfo) {
+    if (!trackInfo) return '';
+    const rawTitle = String(trackInfo.title || '')
+      .replace(/\(.*?\)|\[.*?\]/g, '')
+      .replace(/official\s*(music\s*)?(video|audio|lyric[s]?|visualizer|mv)/gi, '')
+      .replace(/\b(hd|hq|4k|remastered|lyrics?)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const rawAuthor = String(trackInfo.author || '')
+      .replace(/\s*-\s*Topic$/i, '')
+      .replace(/VEVO$/i, '')
+      .replace(/Official$/i, '')
+      .trim();
+
+    if (rawAuthor && rawTitle.toLowerCase().includes(rawAuthor.toLowerCase())) {
+      return rawTitle;
+    }
+    return `${rawTitle} ${rawAuthor}`.trim();
+  }
+
+  /**
+   * Mencari stream cadangan di SoundCloud (Ogg Opus) apabila pemutaran YouTube gagal didekode/diblokir.
+   */
+  async findSoundCloudFallback(node, failedTrack) {
+    if (!node || !failedTrack?.info) return null;
+    const query = this.buildCleanSearchQuery(failedTrack.info);
+    if (!query) return null;
+
+    const triedIds = new Set(failedTrack._triedIdentifiers || []);
+    if (failedTrack.info.identifier) triedIds.add(failedTrack.info.identifier);
+
+    try {
+      const res = await node.rest.resolve(`scsearch:${query}`);
+      if (res?.loadType === LoadType.SEARCH && Array.isArray(res.data) && res.data.length > 0) {
+        const candidates = res.data.filter(
+          (c) =>
+            c?.encoded &&
+            !c?.info?.isStream &&
+            !triedIds.has(c.info?.identifier) &&
+            Number(c.info?.length || 0) >= 35000 // Lewati potongan preview 30 detik SoundCloud Go+
+        );
+        const pool = candidates.length > 0
+          ? candidates
+          : res.data.filter((c) => c?.encoded && !triedIds.has(c.info?.identifier));
+
+        if (pool.length === 0) return null;
+
+        const targetLen = Number(failedTrack.info.length || 0);
+        let best = pool[0];
+        if (targetLen > 0) {
+          let bestDiff = Infinity;
+          for (const candidate of pool.slice(0, 6)) {
+            const diff = Math.abs(Number(candidate.info?.length || 0) - targetLen);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              best = candidate;
+            }
+          }
+        }
+
+        const fallback = normalizeTrack(best, failedTrack.requester, {
+          artworkUrl: best.info?.artworkUrl || failedTrack.info.artworkUrl || null,
+          originalSource: 'soundcloud',
+          matchedVia: 'soundcloud-fallback'
+        });
+        fallback._retriedViaSoundCloud = true;
+        fallback._fallbackAttempts = Number(failedTrack._fallbackAttempts || 0) + 1;
+        fallback._triedSources = [...new Set([...(failedTrack._triedSources || []), String(failedTrack.info.sourceName || 'youtube').toLowerCase(), 'soundcloud'])];
+        fallback._triedIdentifiers = [...triedIds, best.info?.identifier].filter(Boolean);
+        fallback.fallbackFrom = failedTrack.info.sourceName || failedTrack.originalSource || 'youtube';
+        return fallback;
+      }
+    } catch (err) {
+      logger.debug(`Fallback SoundCloud gagal untuk "${query}": ${err.message}`);
+    }
+
+    return null;
+  }
+
+  /**
+   * Rantai fallback multi-source terbatas (bounded) saat track gagal dimuat/didekode saat playback:
+   * 1. YouTube / YT Music gagal -> cari di SoundCloud (Ogg Opus murni, bebas AacDecoderLibrary).
+   * 2. SoundCloud gagal -> cari kandidat alternatif YouTube Music / YouTube non-livestream dengan ID berbeda.
+   * Maksimal percobaan dibatasi ketat oleh config.music.maxFallbackAttempts (default 2) agar tidak pernah loop tak terbatas.
+   */
+  async findFallbackTrack(node, failedTrack) {
+    if (!node || !failedTrack?.info) return null;
+
+    const attemptsSoFar = Number(failedTrack._fallbackAttempts || 0);
+    if (attemptsSoFar >= config.music.maxFallbackAttempts) {
+      return null;
+    }
+
+    const srcName = String(failedTrack.info.sourceName || failedTrack.originalSource || '').toLowerCase();
+    const triedSources = new Set(failedTrack._triedSources || []);
+    if (srcName) triedSources.add(srcName);
+
+    const triedIds = new Set(failedTrack._triedIdentifiers || []);
+    if (failedTrack.info.identifier) triedIds.add(failedTrack.info.identifier);
+
+    // Prioritas 1: SoundCloud Ogg Opus (sangat andal di Android Termux ARM64 karena Pure-Java Opus Passthrough)
+    if (!triedSources.has('soundcloud') && !failedTrack._retriedViaSoundCloud) {
+      const scFallback = await this.findSoundCloudFallback(node, failedTrack);
+      if (scFallback?.encoded) {
+        return scFallback;
+      }
+      triedSources.add('soundcloud');
+    }
+
+    // Prioritas 2: Kandidat track alternatif non-live dari YouTube Music / YouTube dengan identifier berbeda
+    const query = this.buildCleanSearchQuery(failedTrack.info);
+    if (!query) return null;
+
+    const altPrefixes = ['ytmsearch', 'ytsearch'];
+    for (const prefix of altPrefixes) {
+      try {
+        const res = await node.rest.resolve(`${prefix}:${query}`);
+        if (res?.loadType === LoadType.SEARCH && Array.isArray(res.data) && res.data.length > 0) {
+          const alt = res.data.find(
+            (c) =>
+              c?.encoded &&
+              !c?.info?.isStream &&
+              c.info?.identifier &&
+              !triedIds.has(c.info.identifier)
+          );
+          if (alt) {
+            const normalized = normalizeTrack(alt, failedTrack.requester, {
+              artworkUrl: alt.info?.artworkUrl || failedTrack.info.artworkUrl || null,
+              matchedVia: `${prefix.replace('search', '')}-fallback`
+            });
+            normalized._fallbackAttempts = attemptsSoFar + 1;
+            normalized._triedSources = [...triedSources, String(alt.info?.sourceName || prefix).toLowerCase()];
+            normalized._triedIdentifiers = [...triedIds, alt.info.identifier];
+            normalized.fallbackFrom = srcName || 'unknown';
+            return normalized;
+          }
+        }
+      } catch (err) {
+        logger.debug(`Fallback ${prefix} gagal untuk "${query}": ${err.message}`);
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Titik masuk utama pemrosesan input lagu/URL multi-source.
    */
-  async resolve(node, rawQuery, requester) {
+  async resolve(node, rawQuery, requester, options = {}) {
+    const guildId = options.guildId || null;
+
     if (!node) {
       throw new AppError(
         ErrorCodes.LAVALINK_OFFLINE,
@@ -741,9 +919,26 @@ class SourceResolver {
     }
 
     const classified = classifyInput(rawQuery);
+    if (this.audioDiagnostics && guildId) {
+      this.audioDiagnostics.recordStage(
+        guildId,
+        2,
+        'Klasifikasi & Pencarian Sumber',
+        `tipe=${classified.type}, input="${String(rawQuery).slice(0, 80)}"`
+      );
+    }
 
     if (classified.type === 'spotify') {
-      return this.resolveSpotify(node, classified, requester);
+      const spResult = await this.resolveSpotify(node, classified, requester);
+      if (this.audioDiagnostics && guildId) {
+        this.audioDiagnostics.recordStage(
+          guildId,
+          3,
+          'Track Spotify Berhasil Dicocokkan',
+          `jenis=${spResult.kind}, jumlah=${spResult.tracks.length}`
+        );
+      }
+      return spResult;
     }
 
     if (classified.type === 'search') {
@@ -760,6 +955,14 @@ class SourceResolver {
           `Tidak ditemukan hasil lagu untuk kata kunci **"${classified.query}"**.`
         );
       }
+      if (this.audioDiagnostics && guildId) {
+        this.audioDiagnostics.recordStage(
+          guildId,
+          3,
+          'Track Pencarian Dimuat Lavalink',
+          `judul="${results[0].info.title}" [${results[0].info.sourceName}]`
+        );
+      }
       return {
         kind: 'track',
         tracks: [results[0]]
@@ -772,7 +975,49 @@ class SourceResolver {
       response = await node.rest.resolve(classified.url);
     } catch (err) {
       logger.error(`Kegagalan REST Lavalink saat memproses URL ${classified.url}`, err);
+      if (this.audioDiagnostics) {
+        this.audioDiagnostics.recordTrackError({
+          guildId,
+          nodeName: node.name,
+          track: { info: { title: classified.url, sourceName: classified.type } },
+          stage: 'URL_REST',
+          rawException: err
+        });
+      }
       throw err;
+    }
+
+    // Jika URL YouTube/YT Music gagal dimuat langsung di sisi Lavalink (ERROR/EMPTY),
+    // coba ambil judul via oEmbed publik YouTube lalu cari stream cadangan di SoundCloud!
+    if (
+      (!response || response.loadType === LoadType.ERROR || response.loadType === LoadType.EMPTY) &&
+      (classified.type === 'youtube' || classified.type === 'youtube_music')
+    ) {
+      if (response?.loadType === LoadType.ERROR && this.audioDiagnostics) {
+        this.audioDiagnostics.recordTrackError({
+          guildId,
+          nodeName: node.name,
+          track: { info: { title: classified.url, sourceName: classified.type } },
+          stage: 'URL_LOAD',
+          rawException: response.data
+        });
+      }
+
+      const ytFallback = await this.tryResolveYoutubeUrlViaFallback(node, classified.url, requester);
+      if (ytFallback) {
+        if (this.audioDiagnostics && guildId) {
+          this.audioDiagnostics.recordStage(
+            guildId,
+            3,
+            'URL YouTube Dialihkan ke Sumber Fallback',
+            `judul="${ytFallback.info.title}" [${ytFallback.info.sourceName}]`
+          );
+        }
+        return {
+          kind: 'track',
+          tracks: [ytFallback]
+        };
+      }
     }
 
     if (!response || response.loadType === LoadType.EMPTY) {
@@ -789,7 +1034,17 @@ class SourceResolver {
     }
 
     if (response.loadType === LoadType.ERROR) {
-      const causeMsg = response.data?.message || 'Tidak dapat memuat sumber audio.';
+      let diagnosis = null;
+      if (this.audioDiagnostics) {
+        diagnosis = this.audioDiagnostics.recordTrackError({
+          guildId,
+          nodeName: node.name,
+          track: { info: { title: classified.url, sourceName: classified.type } },
+          stage: 'URL_LOAD',
+          rawException: response.data
+        });
+      }
+      const causeMsg = diagnosis?.userMessage || response.data?.message || 'Tidak dapat memuat sumber audio.';
       if (classified.type === 'generic_url') {
         throw new AppError(
           ErrorCodes.UNSUPPORTED_SOURCE,
@@ -805,13 +1060,20 @@ class SourceResolver {
     const sourceOverride = classified.type === 'youtube_music' ? 'youtubemusic' : undefined;
 
     if (response.loadType === LoadType.TRACK && response.data) {
+      const normalized = normalizeTrack(response.data, requester, {
+        originalSource: sourceOverride || response.data.info?.sourceName
+      });
+      if (this.audioDiagnostics && guildId) {
+        this.audioDiagnostics.recordStage(
+          guildId,
+          3,
+          'Track URL Dimuat Lavalink',
+          `judul="${normalized.info.title}" [${normalized.info.sourceName}]`
+        );
+      }
       return {
         kind: 'track',
-        tracks: [
-          normalizeTrack(response.data, requester, {
-            originalSource: sourceOverride || response.data.info?.sourceName
-          })
-        ]
+        tracks: [normalized]
       };
     }
 
@@ -823,6 +1085,14 @@ class SourceResolver {
             originalSource: sourceOverride || t.info?.sourceName
           })
         );
+      if (this.audioDiagnostics && guildId) {
+        this.audioDiagnostics.recordStage(
+          guildId,
+          3,
+          'Playlist URL Dimuat Lavalink',
+          `nama="${response.data.info?.name || 'Playlist'}", jumlah=${tracks.length}`
+        );
+      }
       return {
         kind: 'playlist',
         playlistInfo: {
@@ -834,13 +1104,20 @@ class SourceResolver {
     }
 
     if (response.loadType === LoadType.SEARCH && Array.isArray(response.data) && response.data.length > 0) {
+      const normalized = normalizeTrack(response.data[0], requester, {
+        originalSource: sourceOverride || response.data[0].info?.sourceName
+      });
+      if (this.audioDiagnostics && guildId) {
+        this.audioDiagnostics.recordStage(
+          guildId,
+          3,
+          'Track Hasil URL Dimuat Lavalink',
+          `judul="${normalized.info.title}" [${normalized.info.sourceName}]`
+        );
+      }
       return {
         kind: 'track',
-        tracks: [
-          normalizeTrack(response.data[0], requester, {
-            originalSource: sourceOverride || response.data[0].info?.sourceName
-          })
-        ]
+        tracks: [normalized]
       };
     }
 
@@ -848,6 +1125,33 @@ class SourceResolver {
       ErrorCodes.TRACK_NOT_FOUND,
       'Tidak ditemukan media audio yang dapat diputar dari tautan tersebut.'
     );
+  }
+
+  /**
+   * Jika URL YouTube spesifik gagal dimuat langsung oleh Lavalink, ambil metadata judul/artis
+   * dari endpoint resmi YouTube oEmbed lalu cocokkan ke SoundCloud agar lagu tetap dapat diputar.
+   */
+  async tryResolveYoutubeUrlViaFallback(node, youtubeUrl, requester) {
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(youtubeUrl)}&format=json`;
+      const res = await fetch(oembedUrl, { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) return null;
+      const meta = await res.json();
+      if (!meta?.title) return null;
+
+      return await this.findSoundCloudFallback(node, {
+        info: {
+          title: meta.title,
+          author: meta.author_name || '',
+          length: 0,
+          artworkUrl: meta.thumbnail_url || null,
+          sourceName: 'youtube'
+        },
+        requester
+      });
+    } catch {
+      return null;
+    }
   }
 }
 

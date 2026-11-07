@@ -8,6 +8,7 @@ const {
   version: voiceLibVersion
 } = require('@discordjs/voice');
 const { Constants } = require('shoukaku');
+const { config } = require('../../config/config');
 const { MusicPlayer } = require('./musicPlayer');
 const { AppError, ErrorCodes } = require('../utils/errorHandler');
 const logger = require('../utils/logger').child('PlayerManager');
@@ -101,6 +102,44 @@ class PlayerManager {
   }
 
   /**
+   * Mengambil diagnostik aman status koneksi voice Discord & Shoukaku untuk sebuah server
+   * TANPA pernah menampilkan voice token rahasia.
+   */
+  getVoiceDiagnostics(guildId) {
+    const id = String(guildId);
+    const conn = this.client.shoukaku?.connections?.get(id) || null;
+    const shoukakuPlayer = this.client.shoukaku?.players?.get(id) || null;
+    const guild = this.client.guilds?.cache?.get(id) || null;
+    const botVoiceChannelId = guild?.members?.me?.voice?.channelId || null;
+
+    const stateNames = {
+      0: 'CONNECTING',
+      1: 'CONNECTED',
+      2: 'DISCONNECTING',
+      3: 'DISCONNECTED'
+    };
+
+    let endpointHost = null;
+    if (conn?.serverUpdate?.endpoint) {
+      endpointHost = String(conn.serverUpdate.endpoint).split(':')[0];
+    }
+
+    return {
+      botVoiceChannelId,
+      shoukakuState: conn ? stateNames[conn.state] || `STATE_${conn.state}` : 'NONE',
+      channelId: conn?.channelId || botVoiceChannelId || null,
+      hasSessionId: Boolean(conn?.sessionId),
+      hasServerUpdate: Boolean(conn?.serverUpdate?.endpoint && conn?.serverUpdate?.token),
+      endpointHost,
+      region: conn?.region || null,
+      deafened: Boolean(conn?.deafened),
+      muted: Boolean(conn?.muted),
+      hasLavalinkPlayer: Boolean(shoukakuPlayer),
+      voicePingMs: typeof shoukakuPlayer?.ping === 'number' ? shoukakuPlayer.ping : null
+    };
+  }
+
+  /**
    * Membuat atau mengambil sesi MusicPlayer untuk sebuah server, otomatis bergabung ke voice channel.
    */
   async getOrCreate({ guild, voiceChannel, textChannelId = null }) {
@@ -133,8 +172,17 @@ class PlayerManager {
 
   async _createSession({ guild, voiceChannel, textChannelId, existing = null }) {
     const guildId = String(guild.id);
-    this.requireAvailableNode();
+    const node = this.requireAvailableNode();
     this.ensureCleanLocalVoiceAdapter(guildId);
+
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordStage(
+        guildId,
+        4,
+        'Inisialisasi Sesi Player',
+        `node="${node.name}", channel="#${voiceChannel.name || voiceChannel.id}"`
+      );
+    }
 
     // Jika terdapat sisa koneksi Shoukaku menggantung tanpa player, bersihkan terlebih dahulu
     if (
@@ -142,6 +190,15 @@ class PlayerManager {
       !this.client.shoukaku.players.has(guildId)
     ) {
       await this.client.shoukaku.leaveVoiceChannel(guildId).catch(() => {});
+    }
+
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordStage(
+        guildId,
+        5,
+        'Bergabung ke Voice Channel Discord',
+        `channelId=${voiceChannel.id}`
+      );
     }
 
     let shoukakuPlayer;
@@ -155,10 +212,29 @@ class PlayerManager {
       });
     } catch (err) {
       logger.error(`Gagal bergabung ke voice channel ${voiceChannel.id} di guild ${guildId}`, err);
+      if (this.client.audioDiagnostics) {
+        this.client.audioDiagnostics.recordTrackError({
+          guildId,
+          nodeName: node.name,
+          track: { info: { title: `Join #${voiceChannel.name || voiceChannel.id}`, sourceName: 'discord-voice' } },
+          stage: 'VOICE_JOIN',
+          rawException: err
+        });
+      }
       throw new AppError(
         ErrorCodes.VOICE_CONNECTION_FAILED,
-        `Gagal terhubung ke voice channel <#${voiceChannel.id}>. Periksa izin bot dan status koneksi Lavalink.`,
+        `Gagal terhubung ke voice channel <#${voiceChannel.id}>. Periksa izin bot (\`Connect\` & \`Speak\`) serta koneksi Lavalink.`,
         { cause: err }
+      );
+    }
+
+    const voiceDiag = this.getVoiceDiagnostics(guildId);
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.recordStage(
+        guildId,
+        6,
+        'Handshake Voice State & Voice Server Siap',
+        `state=${voiceDiag.shoukakuState}, session=${voiceDiag.hasSessionId}, endpoint=${voiceDiag.endpointHost || 'ready'}`
       );
     }
 
@@ -179,10 +255,16 @@ class PlayerManager {
     }
 
     const guildSettings = this.client.guildsRepo.getSettings(guildId);
+    const nativeBroken = this.client.audioDiagnostics?.isNativeDecoderBroken(
+      shoukakuPlayer.node?.name || node.name
+    );
 
     if (existing && !existing.destroyed) {
       existing.voiceChannelId = String(voiceChannel.id);
       if (textChannelId) existing.textChannelId = String(textChannelId);
+      if (nativeBroken && existing.volume !== config.music.opusPassthroughVolume) {
+        existing.volume = config.music.opusPassthroughVolume;
+      }
       existing.attachNewShoukakuPlayer(shoukakuPlayer);
       await shoukakuPlayer.setGlobalVolume(existing.volume).catch(() => {});
       return existing;
@@ -197,6 +279,10 @@ class PlayerManager {
       shoukakuPlayer,
       guildSettings
     });
+
+    if (nativeBroken && musicPlayer.volume !== config.music.opusPassthroughVolume) {
+      musicPlayer.volume = config.music.opusPassthroughVolume;
+    }
 
     await shoukakuPlayer.setGlobalVolume(musicPlayer.volume).catch(() => {});
     this.players.set(guildId, musicPlayer);
@@ -221,6 +307,10 @@ class PlayerManager {
       await this.client.shoukaku.leaveVoiceChannel(id).catch((err) => {
         logger.debug(`leaveVoiceChannel(${id}) diabaikan: ${err.message}`);
       });
+    }
+
+    if (this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.clearGuildStage(id);
     }
 
     this.ensureCleanLocalVoiceAdapter(id);

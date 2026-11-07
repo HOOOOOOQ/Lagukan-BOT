@@ -42,15 +42,16 @@ const REQUIRED_COMMANDS = [
   'saveplaylist',
   'loadplaylist',
   'dj',
-  // Information (5)
+  // Information (6)
   'help',
   'ping',
   'botinfo',
   'serverinfo',
-  'stats'
+  'stats',
+  'debugmusic'
 ];
 
-test('Integritas Identitas, LaguKanClient, dan Seluruh 33 Slash Commands', async () => {
+test('Integritas Identitas, LaguKanClient, dan Seluruh 34 Slash Commands', async () => {
   assert.equal(config.bot.name, 'LaguKan');
   assert.equal(config.bot.developer, '666pallxXx');
 

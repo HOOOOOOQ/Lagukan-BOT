@@ -41,10 +41,13 @@ const config = {
   },
 
   music: {
-    defaultVolume: parseInteger(process.env.DEFAULT_VOLUME, 80, 1, 200),
+    defaultVolume: parseInteger(process.env.DEFAULT_VOLUME, 100, 1, 200),
     maxVolume: parseInteger(process.env.MAX_VOLUME, 200, 100, 500),
     minVolume: 0,
     volumeStep: 10,
+    opusPassthroughVolume: 100,
+    maxFallbackAttempts: parseInteger(process.env.MAX_FALLBACK_ATTEMPTS, 2, 0, 4),
+    trackStartTimeoutMs: parseInteger(process.env.TRACK_START_TIMEOUT_MS, 15000, 3000, 45000),
     maxQueueSize: parseInteger(process.env.MAX_QUEUE_SIZE, 500, 10, 5000),
     maxPlaylistTracks: parseInteger(process.env.MAX_PLAYLIST_TRACKS, 200, 10, 1000),
     defaultSearchSource: ['ytmsearch', 'ytsearch', 'scsearch'].includes(

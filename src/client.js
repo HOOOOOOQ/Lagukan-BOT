@@ -9,6 +9,7 @@ const { GuildRepository } = require('./database/guildRepository');
 const { PlaylistRepository } = require('./database/playlistRepository');
 const { SourceResolver } = require('./music/sourceResolver');
 const { PlayerManager } = require('./music/playerManager');
+const { AudioDiagnostics } = require('./music/audioDiagnostics');
 const { loadCommands } = require('./handlers/commandHandler');
 const { loadEvents } = require('./handlers/eventHandler');
 const { globalRateLimiter } = require('./utils/rateLimiter');
@@ -29,7 +30,8 @@ class LaguKanClient extends Client {
     this.db = new DatabaseManager(config.database.path);
     this.guildsRepo = new GuildRepository(this.db);
     this.playlistsRepo = new PlaylistRepository(this.db);
-    this.sourceResolver = new SourceResolver();
+    this.audioDiagnostics = new AudioDiagnostics();
+    this.sourceResolver = new SourceResolver(this.audioDiagnostics);
 
     const shoukakuNodes = lavalinkConfig.nodes.map((n) => ({
       name: n.name,

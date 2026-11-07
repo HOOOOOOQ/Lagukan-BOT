@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ==========================================================
-# Script Instalasi Cepat LaguKan untuk Android Termux
+# Script Instalasi Cepat LaguKan untuk Android Termux ARM64
 # Bot Name : LaguKan
 # Developer: 666pallxXx
 # ==========================================================
@@ -12,27 +12,36 @@ echo "🎵 Memulai Persiapan Lingkungan LaguKan di Android Termux"
 echo "👨‍💻 Developer: 666pallxXx"
 echo "=========================================================="
 
-echo "[1/4] Memperbarui repositori paket Termux..."
+echo "[1/5] Memperbarui repositori paket Termux..."
 pkg update -y && pkg upgrade -y
 
-echo "[2/4] Menginstal Node.js LTS, Git, OpenJDK 21 (untuk Lavalink), dan Tmux..."
-pkg install -y nodejs-lts git openjdk-21 tmux curl
+echo "[2/5] Menginstal Node.js LTS, Git, OpenJDK 21, proot-distro, Tmux, dan Curl..."
+pkg install -y nodejs-lts git openjdk-21 proot-distro tmux curl
 
-echo "[3/4] Menginstal dependency Node.js project LaguKan..."
+echo "[3/5] Menginstal dependency Node.js project LaguKan..."
 npm install
 
 if [ ! -f ".env" ]; then
-  echo "[4/4] Menyalin .env.example menjadi .env..."
+  echo "[4/5] Menyalin .env.example menjadi .env..."
   cp .env.example .env
   echo "⚠️  Silakan edit file .env menggunakan perintah: nano .env"
 else
-  echo "[4/4] File .env sudah ada, melewati penyalinan."
+  echo "[4/5] File .env sudah ada, melewati penyalinan."
 fi
+
+chmod +x scripts/start-lavalink-termux.sh 2>/dev/null || true
+
+echo "[5/5] Informasi Server Audio Lavalink (Proses Java Terpisah):"
+echo "   Untuk dukungan penuh decoder native ARM64 (AAC/Opus/libdave) di Android Termux:"
+echo "   1. ./scripts/start-lavalink-termux.sh --setup-glibc"
+echo "   2. ./scripts/start-lavalink-termux.sh"
 
 echo "=========================================================="
 echo "✅ Instalasi dasar selesai!"
 echo "Langkah selanjutnya:"
-echo "1. Edit konfigurasi  : nano .env"
-echo "2. Deploy command    : npm run deploy"
-echo "3. Jalankan bot      : npm start"
+echo "1. Edit konfigurasi bot      : nano .env"
+echo "2. Siapkan runtime Lavalink  : ./scripts/start-lavalink-termux.sh --setup-glibc"
+echo "3. Jalankan server Lavalink  : ./scripts/start-lavalink-termux.sh (di sesi tmux 1)"
+echo "4. Deploy Slash Command      : npm run deploy"
+echo "5. Jalankan LaguKan Bot      : npm start (di sesi tmux 2)"
 echo "=========================================================="
