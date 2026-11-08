@@ -61,11 +61,18 @@ const config = {
     trackStartTimeoutMs: parseInteger(process.env.TRACK_START_TIMEOUT_MS, 15000, 3000, 45000),
     maxQueueSize: parseInteger(process.env.MAX_QUEUE_SIZE, 500, 10, 5000),
     maxPlaylistTracks: parseInteger(process.env.MAX_PLAYLIST_TRACKS, 200, 10, 1000),
-    defaultSearchSource: ['ytmsearch', 'ytsearch', 'scsearch'].includes(
+    defaultSearchSource: ['ytmsearch', 'ytsearch', 'scsearch', 'bcsearch'].includes(
       (process.env.DEFAULT_SEARCH_SOURCE || '').trim()
     )
       ? process.env.DEFAULT_SEARCH_SOURCE.trim()
       : 'ytmsearch',
+    youtubeDegradedCooldownMs: parseInteger(
+      process.env.YOUTUBE_DEGRADED_COOLDOWN_MS,
+      10 * 60 * 1000,
+      30000,
+      60 * 60 * 1000
+    ),
+    enableDirectDaveFallback: parseBoolean(process.env.DIRECT_VOICE_FALLBACK, true),
     idleTimeoutMs: parseInteger(process.env.IDLE_TIMEOUT_SECONDS, 120, 15, 3600) * 1000,
     playerRefreshIntervalMs: 25000,
     maxHistorySize: 50

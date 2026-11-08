@@ -149,11 +149,41 @@ function classifyInput(rawQuery) {
       return { type: 'soundcloud', url: parsed.toString() };
     }
 
+    if (host === 'bandcamp.com' || host.endsWith('.bandcamp.com')) {
+      return { type: 'bandcamp', url: parsed.toString() };
+    }
+
+    if (host === 'vimeo.com' || host.endsWith('.vimeo.com')) {
+      return { type: 'vimeo', url: parsed.toString() };
+    }
+
+    if (host === 'twitch.tv' || host.endsWith('.twitch.tv')) {
+      return { type: 'twitch', url: parsed.toString() };
+    }
+
     if (DIRECT_AUDIO_EXT_REGEX.test(parsed.pathname)) {
       return { type: 'direct_audio', url: parsed.toString() };
     }
 
     return { type: 'generic_url', url: parsed.toString(), host };
+  }
+
+  // Dukungan prefix pencarian eksplisit seperti "scsearch:Hindia" atau "bcsearch:Lofi"
+  const explicitPrefixMatch = input.match(/^(scsearch|bcsearch|ytmsearch|ytsearch|spsearch|dzsearch):(.+)$/i);
+  if (explicitPrefixMatch) {
+    const cleanExplicitQuery = explicitPrefixMatch[2].trim();
+    if (!cleanExplicitQuery) {
+      throw new AppError(
+        ErrorCodes.VALIDATION_ERROR,
+        'Masukkan kata kunci lagu setelah prefix pencarian.',
+        { isWarning: true }
+      );
+    }
+    return {
+      type: 'search',
+      explicitPrefix: explicitPrefixMatch[1].toLowerCase(),
+      query: cleanExplicitQuery
+    };
   }
 
   // Deteksi percobaan URL rusak seperti "http://..." dengan spasi atau "www.contoh"
@@ -468,11 +498,36 @@ class SourceResolver {
   }
 
   /**
-   * Mencocokkan metadata lagu (judul + artis + durasi) ke sumber audio Lavalink (YT Music -> YouTube -> SoundCloud).
+   * Menentukan urutan prioritas sumber pencarian berdasarkan kesehatan real-time node YouTube.
+   * Jika YouTube sedang terkena blokir bot/login/403 (isYoutubeDegraded), otomatis utamakan
+   * SoundCloud (scsearch) & Bandcamp (bcsearch) agar pengguna langsung mendapat stream yang dapat diputar!
+   */
+  getSearchPrefixOrder(node, preferredPrefix = config.music.defaultSearchSource, isExplicit = false) {
+    if (isExplicit && preferredPrefix) {
+      return [preferredPrefix, 'scsearch', 'bcsearch', 'ytmsearch', 'ytsearch'].filter(
+        (v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx
+      );
+    }
+
+    const ytDegraded = Boolean(this.audioDiagnostics?.isYoutubeDegraded?.(node?.name));
+    if (ytDegraded) {
+      return ['scsearch', 'bcsearch', 'ytmsearch', 'ytsearch'].filter(
+        (v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx
+      );
+    }
+
+    return [preferredPrefix, 'ytmsearch', 'scsearch', 'bcsearch', 'ytsearch'].filter(
+      (v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx
+    );
+  }
+
+  /**
+   * Mencocokkan metadata lagu (judul + artis + durasi) ke sumber audio Lavalink
+   * (otomatis beralih ke SoundCloud & Bandcamp jika YouTube terdegradasi).
    */
   async matchMetadataToAudio(node, meta, requester) {
     const cleanQuery = `${meta.title || ''} ${meta.author || ''}`.trim();
-    const prefixes = ['ytmsearch', 'ytsearch', 'scsearch'];
+    const prefixes = this.getSearchPrefixOrder(node, config.music.defaultSearchSource, false);
 
     for (const prefix of prefixes) {
       try {
@@ -707,7 +762,14 @@ class SourceResolver {
    * Mendukung fallback lintas sumber otomatis (YouTube Music -> YouTube -> SoundCloud)
    * serta memprioritaskan track non-livestream agar kompatibel dengan stream Opus.
    */
-  async searchTracks(node, query, sourcePrefix = config.music.defaultSearchSource, limit = 10, requester = null) {
+  async searchTracks(
+    node,
+    query,
+    sourcePrefix = config.music.defaultSearchSource,
+    limit = 10,
+    requester = null,
+    { explicitPrefix = false } = {}
+  ) {
     if (!node) {
       throw new AppError(
         ErrorCodes.LAVALINK_OFFLINE,
@@ -715,9 +777,7 @@ class SourceResolver {
       );
     }
 
-    const fallbackOrder = [sourcePrefix, 'ytmsearch', 'ytsearch', 'scsearch'].filter(
-      (v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx
-    );
+    const fallbackOrder = this.getSearchPrefixOrder(node, sourcePrefix, explicitPrefix);
 
     for (const prefix of fallbackOrder) {
       try {
@@ -840,9 +900,67 @@ class SourceResolver {
   }
 
   /**
+   * Mencari stream cadangan di Bandcamp apabila YouTube & SoundCloud tidak tersedia.
+   */
+  async findBandcampFallback(node, failedTrack) {
+    if (!node || !failedTrack?.info) return null;
+    const query = this.buildCleanSearchQuery(failedTrack.info);
+    if (!query) return null;
+
+    const triedIds = new Set(failedTrack._triedIdentifiers || []);
+    if (failedTrack.info.identifier) triedIds.add(failedTrack.info.identifier);
+
+    try {
+      const res = await node.rest.resolve(`bcsearch:${query}`);
+      if (res?.loadType === LoadType.SEARCH && Array.isArray(res.data) && res.data.length > 0) {
+        const candidates = res.data.filter(
+          (c) => c?.encoded && !c?.info?.isStream && !triedIds.has(c.info?.identifier)
+        );
+        if (candidates.length === 0) return null;
+
+        const targetLen = Number(failedTrack.info.length || 0);
+        let best = candidates[0];
+        if (targetLen > 0) {
+          let bestDiff = Infinity;
+          for (const candidate of candidates.slice(0, 6)) {
+            const diff = Math.abs(Number(candidate.info?.length || 0) - targetLen);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              best = candidate;
+            }
+          }
+        }
+
+        const fallback = normalizeTrack(best, failedTrack.requester, {
+          artworkUrl: best.info?.artworkUrl || failedTrack.info.artworkUrl || null,
+          originalSource: 'bandcamp',
+          matchedVia: 'bandcamp-fallback'
+        });
+        fallback._retriedViaBandcamp = true;
+        fallback._fallbackAttempts = Number(failedTrack._fallbackAttempts || 0) + 1;
+        fallback._triedSources = [
+          ...new Set([
+            ...(failedTrack._triedSources || []),
+            String(failedTrack.info.sourceName || 'youtube').toLowerCase(),
+            'bandcamp'
+          ])
+        ];
+        fallback._triedIdentifiers = [...triedIds, best.info?.identifier].filter(Boolean);
+        fallback.fallbackFrom = failedTrack.info.sourceName || failedTrack.originalSource || 'youtube';
+        return fallback;
+      }
+    } catch (err) {
+      logger.debug(`Fallback Bandcamp gagal untuk "${query}": ${err.message}`);
+    }
+
+    return null;
+  }
+
+  /**
    * Rantai fallback multi-source terbatas (bounded) saat track gagal dimuat/didekode saat playback:
-   * 1. YouTube / YT Music gagal -> cari di SoundCloud (Ogg Opus murni, bebas AacDecoderLibrary).
-   * 2. SoundCloud gagal -> cari kandidat alternatif YouTube Music / YouTube non-livestream dengan ID berbeda.
+   * 1. Prioritas 1: SoundCloud (scsearch — Ogg Opus murni, bebas login/403 YouTube & bebas AacDecoderLibrary).
+   * 2. Prioritas 2: Bandcamp (bcsearch — stream musik independen legal tanpa blokir YouTube).
+   * 3. Prioritas 3: Kandidat non-livestream alternatif hanya jika YouTube TIDAK sedang terdegradasi.
    * Maksimal percobaan dibatasi ketat oleh config.music.maxFallbackAttempts (default 2) agar tidak pernah loop tak terbatas.
    */
   async findFallbackTrack(node, failedTrack) {
@@ -869,7 +987,20 @@ class SourceResolver {
       triedSources.add('soundcloud');
     }
 
-    // Prioritas 2: Kandidat track alternatif non-live dari YouTube Music / YouTube dengan identifier berbeda
+    // Prioritas 2: Bandcamp (bcsearch — didukung bawaan oleh Lavalink v4 ketika bandcamp: true)
+    if (!triedSources.has('bandcamp') && !failedTrack._retriedViaBandcamp) {
+      const bcFallback = await this.findBandcampFallback(node, failedTrack);
+      if (bcFallback?.encoded) {
+        return bcFallback;
+      }
+      triedSources.add('bandcamp');
+    }
+
+    // Prioritas 3: Kandidat alternatif YouTube HANYA apabila node YouTube tidak sedang terdegradasi (403/login/AllClientsFailed)
+    if (this.audioDiagnostics?.isYoutubeDegraded?.(node.name)) {
+      return null;
+    }
+
     const query = this.buildCleanSearchQuery(failedTrack.info);
     if (!query) return null;
 
@@ -945,9 +1076,10 @@ class SourceResolver {
       const results = await this.searchTracks(
         node,
         classified.query,
-        config.music.defaultSearchSource,
+        classified.explicitPrefix || config.music.defaultSearchSource,
         5,
-        requester
+        requester,
+        { explicitPrefix: Boolean(classified.explicitPrefix) }
       );
       if (results.length === 0) {
         throw new AppError(
@@ -1063,6 +1195,9 @@ class SourceResolver {
       const normalized = normalizeTrack(response.data, requester, {
         originalSource: sourceOverride || response.data.info?.sourceName
       });
+      if (classified.type === 'direct_audio') {
+        normalized.directStreamUrl = classified.url;
+      }
       if (this.audioDiagnostics && guildId) {
         this.audioDiagnostics.recordStage(
           guildId,
@@ -1139,7 +1274,7 @@ class SourceResolver {
       const meta = await res.json();
       if (!meta?.title) return null;
 
-      return await this.findSoundCloudFallback(node, {
+      const syntheticFailed = {
         info: {
           title: meta.title,
           author: meta.author_name || '',
@@ -1148,7 +1283,11 @@ class SourceResolver {
           sourceName: 'youtube'
         },
         requester
-      });
+      };
+
+      const scMatch = await this.findSoundCloudFallback(node, syntheticFailed);
+      if (scMatch) return scMatch;
+      return await this.findBandcampFallback(node, syntheticFailed);
     } catch {
       return null;
     }

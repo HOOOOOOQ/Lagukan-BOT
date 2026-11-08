@@ -19,8 +19,9 @@ Cukup bergabung ke **Voice Channel** mana saja di server Discord Anda, ketik `/p
   - **YouTube** (Video, Shorts, & Playlist)
   - **YouTube Music** (Lagu & Playlist)
   - **Spotify** (Track, Album, Playlist, & Top Artist — *membaca metadata resmi/publik Spotify lalu mencocokkannya secara otomatis dengan sumber audio yang tersedia di Lavalink; bukan mengklaim streaming DRM langsung dari Spotify*)
-  - **SoundCloud** (Track & Set/Playlist melalui Lavalink)
-  - **Direct Audio URL** (`.mp3`, `.flac`, `.ogg`, `.wav`, `.m4a`, `.opus`, `.m3u8`)
+  - **SoundCloud & Bandcamp** (Track, Album, & Pencarian Fallback Otomatis saat YouTube terkena pembatasan bot/HTTP 403)
+  - **Vimeo, Twitch, & Direct Audio URL** (`.mp3`, `.flac`, `.ogg`, `.wav`, `.m4a`, `.opus`, `.webm`, `.m3u8`)
+  - **Dukungan Penuh Enkripsi Suara Discord DAVE E2EE v1:** Baik pada sisi Lavalink (`libdave-jvm` via `glibc`) maupun jembatan cadangan Node.js (`@discordjs/voice` + `@snazzah/davey-android-arm64` + `@noble/ciphers` + `opusscript`) tanpa pernah menonaktifkan enkripsi Discord.
   - **Pencarian Cerdas** berdasarkan judul lagu & nama artis
 - **Interactive Embed Music Player (10 Tombol Aktif):**
   - Baris 1: `⏮ Previous` • `⏸ Pause` • `▶ Resume` • `⏭ Skip` • `⏹ Stop`
@@ -189,7 +190,7 @@ Buka aplikasi **Termux**, lalu jalankan:
 
 ```bash
 pkg update -y && pkg upgrade -y
-pkg install -y nodejs-lts git openjdk-21 tmux curl nano
+pkg install -y nodejs-lts git openjdk-21 proot-distro ffmpeg tmux curl nano
 ```
 
 Verifikasi instalasi:
@@ -228,12 +229,10 @@ cd ~/Lagukan-BOT
 # Siapkan runtime Linux ARM64 (glibc + OpenJDK 21) di dalam Termux (cukup 1x saja)
 ./scripts/start-lavalink-termux.sh --setup-glibc
 
-# Edit password Lavalink (pastikan sama persis dengan LAVALINK_PASSWORD di .env)
-mkdir -p ~/lavalink
-cp ~/Lagukan-BOT/config/application.yml.example ~/lavalink/application.yml
-nano ~/lavalink/application.yml
+# Upgrade otomatis konfigurasi application.yml lama & sinkronkan password dari .env
+./scripts/start-lavalink-termux.sh --upgrade-config --setup-glibc
 
-# Jalankan Lavalink di sesi tmux khusus
+# Jalankan Lavalink di sesi tmux khusus (otomatis mengaktifkan libdave-jvm & client IOS/VR)
 tmux new -s lavalink
 cd ~/Lagukan-BOT
 ./scripts/start-lavalink-termux.sh

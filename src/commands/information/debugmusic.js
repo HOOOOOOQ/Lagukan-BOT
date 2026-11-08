@@ -7,6 +7,7 @@ const { createBaseEmbed } = require('../../utils/embeds');
 const { formatDuration, formatUptime, truncate } = require('../../utils/formatters');
 const {
   detectRuntimeEnvironment,
+  inspectDaveSupport,
   detectLocalJavaVersion,
   inspectLocalLavalinkConfig
 } = require('../../music/audioDiagnostics');
@@ -127,7 +128,14 @@ module.exports = {
       ? nodeInfo.sourceManagers.map((s) => `\`${s}\``).join(', ')
       : '*Menunggu koneksi Lavalink*';
 
-    // Active YouTube Clients
+    // Active YouTube Clients & Circuit Breaker Health
+    const ytHealth = primaryNode
+      ? client.audioDiagnostics?.getYoutubeHealth?.(primaryNode.name)
+      : null;
+    const ytHealthLine = ytHealth
+      ? `\n🟠 **Circuit-Breaker YouTube Aktif** (\`${ytHealth.code}\`): Pencarian otomatis diprioritaskan ke **SoundCloud / Bandcamp**.`
+      : '';
+
     let ytClientsText;
     if (localYaml.found && localYaml.youtubeClients.length > 0) {
       const clientTags = localYaml.youtubeClients.map((c) => `\`${c}\``).join(' → ');
@@ -137,15 +145,17 @@ module.exports = {
           : '';
       ytClientsText =
         `${clientTags}\n` +
-        `Remote Cipher: \`${localYaml.hasRemoteCipher ? 'Aktif' : 'Tidak'}\` | OAuth: \`${localYaml.oauthEnabled ? 'Aktif' : 'Nonaktif'}\`${warnNonOpus}`;
+        `ClientOptions: \`${localYaml.hasClientOptions ? 'Aktif' : 'Default'}\` | Remote Cipher: \`${localYaml.hasRemoteCipher ? 'Aktif' : 'Tidak'}\` | OAuth: \`${localYaml.oauthEnabled ? 'Aktif' : 'Nonaktif'}\`${warnNonOpus}${ytHealthLine}`;
     } else {
       const hasYtPlugin = (nodeInfo?.plugins || []).some((p) => /youtube/i.test(p.name));
-      ytClientsText = hasYtPlugin
-        ? '`youtube-plugin` aktif pada Lavalink (file `application.yml` berada di direktori eksternal)'
-        : 'Konfigurasi `application.yml` lokal tidak ditemukan di direktori kerja';
+      ytClientsText =
+        (hasYtPlugin
+          ? '`youtube-plugin` aktif pada Lavalink (file `application.yml` berada di direktori eksternal)'
+          : 'Konfigurasi `application.yml` lokal tidak ditemukan di direktori kerja') + ytHealthLine;
     }
 
-    // 8. Audio Decoder Status
+    // 8. Audio Decoder & DAVE E2EE Protocol Status
+    const daveInfo = client.audioDiagnostics?.daveSupport || inspectDaveSupport();
     const musicPlayer = client.playerManager.get(interaction.guildId);
     const activeVol = musicPlayer ? musicPlayer.volume : config.music.defaultVolume;
     const activeFilter = musicPlayer ? musicPlayer.activeFilterKey : 'off';
@@ -154,10 +164,19 @@ module.exports = {
     const nativeNodeState = primaryNode
       ? client.audioDiagnostics?.getNodeNativeStatus(primaryNode.name)
       : null;
+    const daveNodeState = primaryNode
+      ? client.audioDiagnostics?.getNodeDaveStatus?.(primaryNode.name)
+      : null;
 
     let decoderStatusText =
-      `Pure-Java Opus Passthrough: **${isPureJavaOpusReady ? '🟢 AKTIF (Vol 100%, Tanpa Filter)' : `🟡 NONAKTIF (Vol ${activeVol}%, Filter ${activeFilter})`}**\n`;
+      `Pure-Java Opus Passthrough: **${isPureJavaOpusReady ? '🟢 AKTIF (Vol 100%, Tanpa Filter)' : `🟡 NONAKTIF (Vol ${activeVol}%, Filter ${activeFilter})`}**\n` +
+      `Node.js DAVE E2EE: **${daveInfo.daveyLoaded ? `🟢 v${daveInfo.daveProtocolVersion} (@snazzah/davey ${daveInfo.daveyVersion} • ${daveInfo.daveBindingType})` : '🔴 Tidak Tersedia'}**\n` +
+      `Codec & Cipher Node.js: \`${daveInfo.opusLibrary || 'none'}\` | AEAD: \`${daveInfo.hasAes256Gcm ? 'aes-256-gcm' : ''}${daveInfo.hasXChaCha20Poly1305 ? ' + xchacha20' : ''}\`\n`;
 
+    if (daveNodeState?.daveBroken) {
+      decoderStatusText +=
+        `Lavalink DAVE (\`libdave-jvm\`): 🔴 **Gagal Dimuat (${daveNodeState.code})** — *Jalankan \`./scripts/start-lavalink-termux.sh\` (glibc) atau gunakan Direct DAVE Fallback*\n`;
+    }
     if (nativeNodeState?.broken) {
       decoderStatusText +=
         `Native JNI (\`libconnector.so\`): 🔴 **Gagal Dimuat (${nativeNodeState.code})** — *Self-healing Opus Passthrough diaktifkan otomatis*`;

@@ -1,266 +1,200 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# LaguKan — Peluncur Server Lavalink v4 untuk Android Termux ARM64 (glibc)
+# ==========================================================
+# Peluncur Pintar Lavalink v4 untuk Android Termux ARM64
+# Bot Name : LaguKan
 # Developer: 666pallxXx
 #
-# Mengapa skrip ini sangat krusial di Android Termux?
-# 1. Mencegah error "Authentication failed from /127.0.0.1 GET /v4/websocket":
-#    Menyinkronkan otomatis LAVALINK_PASSWORD (.env) <-> lavalink.server.password
-#    (application.yml) tanpa pernah menampilkan password ke layar log.
-# 2. Mencegah bug "Bot masuk Voice Channel tetapi TIDAK ADA SUARA":
-#    Lavalink v4.2+ membutuhkan library native glibc "libdave-jvm.so" (Discord
-#    Voice v8 DAVE E2EE) serta "libconnector.so" (Opus/AAC DSP). Binary OpenJDK
-#    bawaan Termux memakai Android Bionic libc sehingga gagal memuat JNI glibc
-#    dan membuat transport suara UDP gagal diam-diam (state.connected = false).
-#    Skrip ini otomatis menyiapkan container ringan Debian ARM64 (proot-distro)
-#    yang berbagi jaringan localhost (127.0.0.1:2333) secara langsung dengan bot.
-# ==============================================================================
+# Fitur:
+# 1. Otomatis mengunduh Lavalink v4.2.2 jika belum tersedia.
+# 2. Migrasi & upgrade otomatis ~/lavalink/application.yml lama ke snapshot
+#    youtube-plugin terbaru + clientOptions anti-403 tanpa membocorkan password/OAuth/poToken.
+# 3. Menyiapkan & menjalankan Lavalink di dalam proot-distro Debian ARM64 (glibc)
+#    dengan isolasi bersih (unset LD_PRELOAD & TMPDIR Bionic + direktori ekstraksi JNI)
+#    agar library native libdave-jvm.so (Discord DAVE E2EE Close 4017 fix),
+#    libconnector.so (AAC/Opus/Filter), dan JDA-NAS berjalan 100% kompatibel di ARM64!
+# ==========================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${BOT_DIR}/.env"
-
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAVALINK_DIR="${LAVALINK_DIR:-$HOME/lavalink}"
-LAVALINK_JAR="${LAVALINK_JAR:-$LAVALINK_DIR/Lavalink.jar}"
-LAVALINK_CONFIG="${LAVALINK_CONFIG:-$LAVALINK_DIR/application.yml}"
-DISTRO_NAME="${LAVALINK_PROOT_DISTRO:-debian}"
-JAVA_HEAP_MAX="${JAVA_HEAP_MAX:-768M}"
-JAVA_HEAP_MIN="${JAVA_HEAP_MIN:-256M}"
+LAVALINK_JAR="$LAVALINK_DIR/Lavalink.jar"
+LAVALINK_CONFIG="$LAVALINK_DIR/application.yml"
 LAVALINK_VERSION="${LAVALINK_VERSION:-4.2.2}"
+YOUTUBE_PLUGIN_PIN="2be8e542d3f6f178e048dca565892684c2e40177"
+DEBIAN_DISTRO="debian"
 
-mkdir -p "$LAVALINK_DIR"
-
-if [ ! -f "$LAVALINK_CONFIG" ]; then
-  if [ -f "${BOT_DIR}/config/application.yml.example" ]; then
-    echo "[LaguKan] Menyalin template konfigurasi ke $LAVALINK_CONFIG ..."
-    cp "${BOT_DIR}/config/application.yml.example" "$LAVALINK_CONFIG"
-  else
-    echo "[ERROR] File konfigurasi tidak ditemukan di: $LAVALINK_CONFIG"
-    exit 1
-  fi
+IS_TERMUX=0
+if [ -n "${TERMUX_VERSION:-}" ] || [ -d "/data/data/com.termux/files/usr" ]; then
+  IS_TERMUX=1
 fi
 
-# ------------------------------------------------------------------------------
-# TAHAP 1: Sinkronisasi otomatis password antara .env dan application.yml
-#          (Menggunakan Node.js agar karakter khusus aman & tidak bocor ke log)
-# ------------------------------------------------------------------------------
-if command -v node >/dev/null 2>&1; then
-  BOT_ENV_PATH="$ENV_FILE" YML_CFG_PATH="$LAVALINK_CONFIG" node - <<'EOF'
-const fs = require('node:fs');
-const crypto = require('node:crypto');
+ALLOW_BIONIC=0
+SETUP_GLIBC=0
+FORCE_UPGRADE_CONFIG=0
 
+for arg in "$@"; do
+  case "$arg" in
+    --setup-glibc) SETUP_GLIBC=1 ;;
+    --allow-bionic) ALLOW_BIONIC=1 ;;
+    --upgrade-config) FORCE_UPGRADE_CONFIG=1 ;;
+  esac
+done
+
+mkdir -p "$LAVALINK_DIR/plugins" "$LAVALINK_DIR/logs" "$LAVALINK_DIR/.natives"
+chmod 755 "$LAVALINK_DIR/.natives"
+
+# 1. Unduh Lavalink.jar jika belum ada
+if [ ! -f "$LAVALINK_JAR" ]; then
+  echo "⬇️  Mengunduh Lavalink v${LAVALINK_VERSION} ke $LAVALINK_JAR ..."
+  curl -fL --retry 3 -o "$LAVALINK_JAR" \
+    "https://github.com/lavalink-devs/Lavalink/releases/download/${LAVALINK_VERSION}/Lavalink.jar"
+  echo "✅ Lavalink v${LAVALINK_VERSION} berhasil diunduh."
+fi
+
+# 2. Buat atau migrasikan application.yml lama ke template terbaru
+OLD_YML_BACKUP=""
+if [ ! -f "$LAVALINK_CONFIG" ]; then
+  cp "$REPO_DIR/config/application.yml.example" "$LAVALINK_CONFIG"
+  echo "📝 Menyalin konfigurasi optimal ke $LAVALINK_CONFIG"
+elif [ "$FORCE_UPGRADE_CONFIG" -eq 1 ] || { [ "${SKIP_CONFIG_UPGRADE:-0}" != "1" ] && { ! grep -q "$YOUTUBE_PLUGIN_PIN" "$LAVALINK_CONFIG" 2>/dev/null || ! grep -q "clientOptions:" "$LAVALINK_CONFIG" 2>/dev/null; }; }; then
+  OLD_YML_BACKUP="${LAVALINK_CONFIG}.bak.$(date +%s)"
+  cp "$LAVALINK_CONFIG" "$OLD_YML_BACKUP"
+  cp "$REPO_DIR/config/application.yml.example" "$LAVALINK_CONFIG"
+  rm -f "$LAVALINK_DIR"/plugins/youtube-plugin-*.jar 2>/dev/null || true
+  echo "🔄 Memigrasikan application.yml lama ke snapshot YouTube & DAVE terbaru (backup dibuat)."
+fi
+
+# 3. Sinkronkan password dari .env (atau backup application.yml lama) secara aman menggunakan Node.js
+if command -v node >/dev/null 2>&1; then
+  BOT_ENV_PATH="$REPO_DIR/.env" YML_CFG_PATH="$LAVALINK_CONFIG" OLD_YML_PATH="$OLD_YML_BACKUP" node - <<'EOF'
+const fs = require('node:fs');
 const envPath = process.env.BOT_ENV_PATH;
 const ymlPath = process.env.YML_CFG_PATH;
+const oldYmlPath = process.env.OLD_YML_PATH;
 
-const PLACEHOLDERS = new Set([
-  '',
-  'masukkan_password_lavalink_anda_di_sini',
-  'GANTI_DENGAN_PASSWORD_KUAT_ANDA',
-  'missing_password'
-]);
-
-function cleanSecret(val) {
-  let s = String(val ?? '').trim();
+function cleanVal(v) {
+  let s = String(v || '').trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     s = s.slice(1, -1).trim();
   }
   return s;
 }
 
-let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-let ymlContent = fs.existsSync(ymlPath) ? fs.readFileSync(ymlPath, 'utf8') : '';
-
-let envPw = '';
-for (const line of envContent.split(/\r?\n/)) {
-  const m = line.match(/^\s*LAVALINK_PASSWORD\s*=\s*(.*)\s*$/);
-  if (m) {
-    let raw = m[1].trim();
-    if (!raw.startsWith('"') && !raw.startsWith("'")) {
-      raw = raw.replace(/\s+#.*$/, '').trim();
-    }
-    envPw = cleanSecret(raw);
-    break;
-  }
-}
-
-let ymlPw = '';
-{
-  const lines = ymlContent.split(/\r?\n/);
-  let inLavalink = false;
-  let inServer = false;
-  let serverIndent = -1;
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t || t.startsWith('#')) continue;
-    const indent = line.search(/\S/);
-    if (indent === 0 && /^lavalink\s*:\s*$/.test(t)) {
-      inLavalink = true;
-      inServer = false;
-      continue;
-    }
-    if (inLavalink && indent === 0) {
-      inLavalink = false;
-      inServer = false;
-    }
-    if (inLavalink && /^server\s*:\s*$/.test(t)) {
-      inServer = true;
-      serverIndent = indent;
-      continue;
-    }
-    if (inServer) {
-      if (indent <= serverIndent) {
-        inServer = false;
-      } else {
-        const pm = t.match(/^password\s*:\s*(.+)$/);
-        if (pm) {
-          let raw = pm[1].trim();
-          if (!raw.startsWith('"') && !raw.startsWith("'")) {
-            raw = raw.replace(/\s+#.*$/, '').trim();
-          }
-          ymlPw = cleanSecret(raw);
-          break;
-        }
-      }
+if (ymlPath && fs.existsSync(ymlPath)) {
+  let targetPassword = '';
+  if (envPath && fs.existsSync(envPath)) {
+    const envLines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+    for (const line of envLines) {
+      const m = line.match(/^\s*LAVALINK_PASSWORD\s*=\s*(.*)$/);
+      if (m) targetPassword = cleanVal(m[1]);
     }
   }
-}
+  if ((!targetPassword || targetPassword === 'masukkan_password_lavalink_anda_di_sini') && oldYmlPath && fs.existsSync(oldYmlPath)) {
+    const oldYml = fs.readFileSync(oldYmlPath, 'utf8');
+    const oldMatch = oldYml.match(/^\s*password\s*:\s*([^\r\n#]+)/m);
+    if (oldMatch) targetPassword = cleanVal(oldMatch[1]);
+  }
 
-function updateYmlPassword(content, newPw) {
-  const lines = content.split(/\r?\n/);
-  let inLavalink = false;
-  let inServer = false;
-  let serverIndent = -1;
-  let replaced = false;
-  const escaped = newPw.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const t = lines[i].trim();
-    if (!t || t.startsWith('#')) continue;
-    const indent = lines[i].search(/\S/);
-    if (indent === 0 && /^lavalink\s*:\s*$/.test(t)) {
-      inLavalink = true;
-      inServer = false;
-      continue;
-    }
-    if (inLavalink && indent === 0) {
-      inLavalink = false;
-      inServer = false;
-    }
-    if (inLavalink && /^server\s*:\s*$/.test(t)) {
-      inServer = true;
-      serverIndent = indent;
-      continue;
-    }
-    if (inServer) {
-      if (indent <= serverIndent) {
-        inServer = false;
-      } else if (/^password\s*:/.test(t) && !replaced) {
-        const pad = ' '.repeat(indent);
-        lines[i] = `${pad}password: "${escaped}"`;
-        replaced = true;
-        break;
-      }
+  if (targetPassword && targetPassword !== 'masukkan_password_lavalink_anda_di_sini') {
+    const ymlContent = fs.readFileSync(ymlPath, 'utf8');
+    const escaped = targetPassword.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const updated = ymlContent.replace(
+      /^(\s*password\s*:\s*).*$/m,
+      `$1"${escaped}"`
+    );
+    if (updated !== ymlContent) {
+      fs.writeFileSync(ymlPath, updated, 'utf8');
+      console.log('🔐 Password Lavalink berhasil disinkronkan otomatis antara .env dan application.yml.');
     }
   }
-  return replaced ? lines.join('\n') : content;
-}
-
-function updateEnvPassword(content, newPw) {
-  const lines = content.split(/\r?\n/);
-  let replaced = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    if (/^\s*LAVALINK_PASSWORD\s*=/.test(lines[i])) {
-      lines[i] = `LAVALINK_PASSWORD=${newPw}`;
-      replaced = true;
-      break;
-    }
-  }
-  if (!replaced) {
-    lines.push(`LAVALINK_PASSWORD=${newPw}`);
-  }
-  return lines.join('\n');
-}
-
-const envIsPlaceholder = PLACEHOLDERS.has(envPw);
-const ymlIsPlaceholder = PLACEHOLDERS.has(ymlPw);
-
-if (!envIsPlaceholder && envPw !== ymlPw) {
-  fs.writeFileSync(ymlPath, updateYmlPassword(ymlContent, envPw), 'utf8');
-  console.log('[LaguKan] ✅ Password Lavalink di application.yml berhasil disinkronkan otomatis dengan .env!');
-} else if (envIsPlaceholder && !ymlIsPlaceholder && fs.existsSync(envPath)) {
-  fs.writeFileSync(envPath, updateEnvPassword(envContent, ymlPw), 'utf8');
-  console.log('[LaguKan] ✅ LAVALINK_PASSWORD di .env berhasil disinkronkan otomatis dengan application.yml!');
-} else if (envIsPlaceholder && ymlIsPlaceholder) {
-  const generated = 'LaguKan_' + crypto.randomBytes(12).toString('hex');
-  fs.writeFileSync(ymlPath, updateYmlPassword(ymlContent, generated), 'utf8');
-  if (fs.existsSync(envPath)) {
-    fs.writeFileSync(envPath, updateEnvPassword(envContent, generated), 'utf8');
-  }
-  console.log('[LaguKan] ✅ Password Lavalink aman dibuat otomatis dan disinkronkan ke .env & application.yml!');
-} else {
-  console.log('[LaguKan] ✅ Autentikasi password .env dan application.yml sudah cocok.');
 }
 EOF
 fi
 
-# ------------------------------------------------------------------------------
-# TAHAP 2: Pastikan Lavalink.jar tersedia
-# ------------------------------------------------------------------------------
-if [ ! -f "$LAVALINK_JAR" ]; then
-  echo "[LaguKan] Lavalink.jar belum ditemukan di $LAVALINK_JAR. Mengunduh Lavalink v${LAVALINK_VERSION}..."
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL -o "$LAVALINK_JAR" \
-      "https://github.com/lavalink-devs/Lavalink/releases/download/${LAVALINK_VERSION}/Lavalink.jar"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -O "$LAVALINK_JAR" \
-      "https://github.com/lavalink-devs/Lavalink/releases/download/${LAVALINK_VERSION}/Lavalink.jar"
-  else
-    echo "[ERROR] curl/wget tidak ditemukan. Unduh Lavalink.jar ke $LAVALINK_JAR terlebih dahulu."
-    exit 1
+# Fungsi instalasi otomatis runtime Debian ARM64 glibc di Termux
+setup_termux_glibc() {
+  echo "=========================================================="
+  echo "🛠️  Menyiapkan Runtime Debian ARM64 (glibc) untuk Lavalink"
+  echo "   Diperlukan agar libdave-jvm.so (Discord Voice DAVE E2EE)"
+  echo "   dan libconnector.so (AAC/Opus) berjalan 100% di Android ARM64!"
+  echo "=========================================================="
+  if ! command -v proot-distro >/dev/null 2>&1; then
+    pkg update -y
+    pkg install -y proot-distro
   fi
+  proot-distro install "$DEBIAN_DISTRO" || true
+  env -u LD_PRELOAD -u TMPDIR proot-distro login "$DEBIAN_DISTRO" -- bash -c \
+    "export DEBIAN_FRONTEND=noninteractive && apt-get update -y && apt-get install -y --no-install-recommends openjdk-21-jre-headless ca-certificates libstdc++6 libgcc-s1 curl"
+  echo "✅ Runtime Debian ARM64 (glibc + OpenJDK 21 + libstdc++6) siap digunakan!"
+}
+
+# 4. Mode --setup-glibc eksplisit
+if [ "$SETUP_GLIBC" -eq 1 ]; then
+  if [ "$IS_TERMUX" -eq 0 ]; then
+    echo "ℹ️  Sistem ini sudah menggunakan Linux standar (bukan Android Bionic). Tidak perlu proot-distro."
+    exit 0
+  fi
+  setup_termux_glibc
+  exit 0
 fi
 
-# ------------------------------------------------------------------------------
-# TAHAP 3: Di Android Termux ARM64, wajibkan runtime glibc (proot-distro Debian)
-#          agar libdave-jvm.so (Discord Voice v8 E2EE) & UDP transport aktif!
-# ------------------------------------------------------------------------------
-IS_TERMUX=0
-if [ -n "${TERMUX_VERSION:-}" ] || [ -d "/data/data/com.termux/files/usr" ]; then
-  IS_TERMUX=1
-fi
-
-if [ "$IS_TERMUX" -eq 1 ] && ! command -v proot-distro >/dev/null 2>&1; then
-  if command -v pkg >/dev/null 2>&1; then
-    echo "[LaguKan] Menginstal paket Termux 'proot-distro' untuk dukungan penuh Discord Voice DAVE E2EE & UDP..."
-    pkg update -y && pkg install -y proot-distro
+# Helper Node.js aman untuk mengaktifkan/menonaktifkan profil glibc (client IOS + bufferDurationMs)
+apply_runtime_profile() {
+  local profile="$1"
+  if command -v node >/dev/null 2>&1; then
+    YML_CFG_PATH="$LAVALINK_CONFIG" RUNTIME_PROFILE="$profile" node -e '
+      const fs = require("node:fs");
+      const p = process.env.YML_CFG_PATH;
+      const prof = process.env.RUNTIME_PROFILE;
+      if (!p || !fs.existsSync(p)) process.exit(0);
+      let yml = fs.readFileSync(p, "utf8");
+      if (prof === "glibc") {
+        if (!/^\s*-\s*IOS\b/m.test(yml)) {
+          yml = yml.replace(/^(\s*-\s*MUSIC\s*)$/m, "$1\n      - IOS");
+        }
+        if (!/^\s*IOS\s*:/m.test(yml)) {
+          yml = yml.replace(/^(\s*clientOptions\s*:\s*)$/m, "$1\n      IOS:\n        searching: false\n        playlistLoading: false");
+        }
+        yml = yml.replace(/^(\s*bufferDurationMs\s*:\s*)0\b/m, "$1400");
+      } else {
+        yml = yml.replace(/^\s*-\s*IOS\s*\r?\n/gm, "");
+        yml = yml.replace(/^(\s*bufferDurationMs\s*:\s*)400\b/m, "$10");
+      }
+      fs.writeFileSync(p, yml, "utf8");
+    '
   fi
-fi
+}
 
-if command -v proot-distro >/dev/null 2>&1; then
-  echo "[LaguKan] Memeriksa lingkungan runtime glibc ($DISTRO_NAME) via proot-distro..."
+# 5. Jalankan Lavalink dengan alokasi RAM efisien untuk perangkat ARM64
+JVM_FLAGS="-Xms128M -Xmx512M -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -Djdk.tls.client.protocols=TLSv1.2,TLSv1.3"
 
-  if ! proot-distro login "$DISTRO_NAME" -- true >/dev/null 2>&1; then
-    echo "[LaguKan] Menginstal container ringan '$DISTRO_NAME' (hanya dilakukan 1x pada penggunaan pertama)..."
-    proot-distro install "$DISTRO_NAME"
-  fi
-
-  if ! proot-distro login "$DISTRO_NAME" -- command -v java >/dev/null 2>&1; then
-    echo "[LaguKan] Menginstal OpenJDK 21 Headless (glibc ARM64) & sertifikat TLS di '$DISTRO_NAME'..."
-    proot-distro login "$DISTRO_NAME" -- bash -c \
-      "export DEBIAN_FRONTEND=noninteractive && apt-get update -y && (apt-get install -y --no-install-recommends openjdk-21-jre-headless ca-certificates || apt-get install -y --no-install-recommends default-jre-headless ca-certificates) && apt-get clean"
-  fi
-
-  echo "[LaguKan] Menjalankan Lavalink v4 di dalam runtime glibc ARM64 (libdave-jvm + libconnector + UDP siap)..."
-  exec proot-distro login "$DISTRO_NAME" \
-    --bind "$LAVALINK_DIR:/opt/lavalink" \
-    -- bash -c "cd /opt/lavalink && exec java -Xms${JAVA_HEAP_MIN} -Xmx${JAVA_HEAP_MAX} -XX:+UseG1GC -Djdk.tls.client.protocols=TLSv1.2,TLSv1.3 -jar /opt/lavalink/Lavalink.jar"
-fi
-
-echo "[PERINGATAN] 'proot-distro' tidak tersedia — menjalankan Lavalink langsung menggunakan Java sistem."
 if [ "$IS_TERMUX" -eq 1 ]; then
-  echo "[PERINGATAN KRITIS] Di Android Termux tanpa proot-distro (glibc), libdave-jvm.so mungkin gagal dimuat sehingga Discord Voice tidak mengeluarkan suara! Instal dengan: pkg install proot-distro -y"
+  DEBIAN_ROOTFS="${PREFIX:-/data/data/com.termux/files/usr}/var/lib/proot-distro/installed-rootfs/${DEBIAN_DISTRO}"
+
+  # Jika belum ada Debian glibc dan pengguna tidak memaksa --allow-bionic, siapkan otomatis!
+  if [ ! -d "$DEBIAN_ROOTFS" ] && [ "$ALLOW_BIONIC" -eq 0 ]; then
+    echo "⚠️  Mendeteksi Android Termux ARM64 tanpa container Debian glibc."
+    echo "   Discord mewajibkan protokol enkripsi suara DAVE E2EE (libdave-jvm.so membutuhkan glibc)."
+    echo "   Memulai instalasi otomatis runtime Debian ARM64 glibc satu kali..."
+    setup_termux_glibc
+  fi
+
+  if command -v proot-distro >/dev/null 2>&1 && [ -d "$DEBIAN_ROOTFS" ] && [ "$ALLOW_BIONIC" -eq 0 ]; then
+    apply_runtime_profile "glibc"
+    echo "🚀 Menjalankan Lavalink di dalam Debian ARM64 (glibc) — DAVE E2EE (libdave-jvm), AAC/Opus JNI, & YouTube IOS/VR aktif!"
+    exec env -u LD_PRELOAD -u TMPDIR proot-distro login "$DEBIAN_DISTRO" \
+      --bind "$LAVALINK_DIR:/opt/lavalink" \
+      -- bash -c "mkdir -p /tmp /opt/lavalink/.natives && chmod 1777 /tmp && cd /opt/lavalink && exec java $JVM_FLAGS -Djava.io.tmpdir=/tmp -Dlava.native.extractPath=/opt/lavalink/.natives -jar Lavalink.jar"
+  fi
+
+  apply_runtime_profile "bionic"
+  echo "⚠️  PERINGATAN: Lavalink dijalankan pada Java Termux Bionic (--allow-bionic)."
+  echo "   Library libdave-jvm.so di Lavalink tidak dapat dimuat di Bionic (Close 4017),"
+  echo "   namun LaguKan Node.js memiliki fallback Direct DAVE E2EE (@snazzah/davey-android-arm64)!"
 fi
+
 cd "$LAVALINK_DIR"
-exec java -Xms"${JAVA_HEAP_MIN}" -Xmx"${JAVA_HEAP_MAX}" -XX:+UseG1GC -jar "$LAVALINK_JAR"
+mkdir -p "$LAVALINK_DIR/.natives"
+exec java $JVM_FLAGS -Dlava.native.extractPath="$LAVALINK_DIR/.natives" -jar "$LAVALINK_JAR"
