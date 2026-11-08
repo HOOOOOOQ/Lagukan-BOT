@@ -1,8 +1,9 @@
 # ==========================================================
-# CONTOH KONFIGURASI SERVER LAVALINK v4 UNTUK LAGUKAN (ANDROID TERMUX ARM64)
-# Developer: 666pallxXx
-# Salin menjadi application.yml di folder tempat Lavalink.jar berada.
-# Pastikan server.password SAMA PERSIS dengan LAVALINK_PASSWORD di .env!
+# CONTOH KONFIGURASI LAVALINK v4 (OPTIMAL ANDROID TERMUX ARM64 & LINUX)
+# Untuk: LaguKan Discord Music Bot (Developer: 666pallxXx)
+# Simpan sebagai application.yml di folder tempat Lavalink.jar berada,
+# atau jalankan ./scripts/start-lavalink-termux.sh agar disinkronkan &
+# dimigrasikan otomatis (termasuk aktivasi client IOS pada runtime glibc).
 # ==========================================================
 
 server:
@@ -12,76 +13,78 @@ server:
     enabled: false
 
 plugins:
+  # Gunakan snapshot terbaru youtube-source (komit 2be8e542 — Sept 2026:
+  # perbaikan cipher connection starvation #245, contentLength #235, & client 21.x)
   youtube:
     enabled: true
     allowSearch: true
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
-    # Remote Cipher untuk mendekripsi signature stream YouTube terbaru
-    remoteCipher:
-      url: "https://cipher.kikkia.dev/"
-      userAgent: "LaguKan"
-    # ==========================================================
-    # URUTAN CLIENT KHUSUS ANDROID TERMUX ARM64 (OPUS-FIRST):
-    # - MUSIC hanya dipakai untuk pencarian metadata (ytmsearch:)
-    # - ANDROID_VR, ANDROID_MUSIC, dan TVHTML5_SIMPLY menghasilkan stream WebM Opus (itag=251)
-    #   yang dapat diteruskan secara Pure-Java Opus Passthrough (Volume 100%) tanpa JNI AAC!
-    # - JANGAN menambahkan "IOS" pada bare Termux Bionic karena IOS hanya menghasilkan
-    #   stream MP4/HLS AAC (Opus Formats: No) yang memicu error AacDecoderLibrary.getInstance()!
-    # ==========================================================
+
+    # Pemisahan tegas antara client Search vs Stream Playback untuk mencegah HTTP 403 & SABR:
+    # - MUSIC          : Khusus pencarian ytmsearch (playback dinonaktifkan via clientOptions)
+    # - ANDROID_VR     : Stream WebM Opus utama tanpa poToken/OAuth
+    # - TVHTML5_SIMPLY : Fallback stream WebM Opus tanpa OAuth
+    # - WEBEMBEDDED    : Fallback stream WebM Opus untuk video embeddable
+    # - ANDROID_MUSIC  : Fallback stream YouTube Music Opus
+    # - WEB            : Khusus ytsearch & playlistLoading (playback dinonaktifkan agar tidak HTTP 403/SABR)
+    # Catatan: Saat dijalankan via ./scripts/start-lavalink-termux.sh (proot-distro glibc),
+    # script otomatis mengaktifkan client IOS (searching: false) untuk daya tembus ekstra.
     clients:
       - MUSIC
       - ANDROID_VR
-      - ANDROID_MUSIC
       - TVHTML5_SIMPLY
-      - MWEB
       - WEBEMBEDDED
+      - ANDROID_MUSIC
       - WEB
-    # Catatan OAuth & Client TV:
-    # Pada youtube-plugin terbaru, client "TV" menggunakan User-Agent PlayStation 4 Safari yang
-    # mengembalikan format MP4 AAC (membutuhkan decoder native glibc via ./scripts/start-lavalink-termux.sh).
-    # Jika Anda sudah menjalankan Lavalink menggunakan ./scripts/start-lavalink-termux.sh (proot-distro Debian glibc)
-    # dan membutuhkan login OAuth (misal IP seluler terkena blokir), Anda dapat menambahkan "- TV" di urutan
-    # paling bawah clients dan mengaktifkan blok oauth di bawah memakai AKUN GOOGLE CADANGAN (burner):
-    # oauth:
-    #   enabled: true
-    #   # Setelah login 1x di https://www.google.com/device, tempel refreshToken dari log ke bawah ini:
-    #   # refreshToken: "tempel_refresh_token_di_sini"
+
+    clientOptions:
+      MUSIC:
+        playback: false
+        videoLoading: false
+      WEB:
+        playback: false
+        videoLoading: false
+      WEBEMBEDDED:
+        searching: false
+        playlistLoading: false
+
+    # Dekripsi signature cipher jarak jauh agar tahan terhadap pembaruan player script YouTube
+    remoteCipher:
+      url: "https://cipher.kikkia.dev/"
+      userAgent: "LaguKan-MusicBot/1.0"
+
+    # OPSIONAL — PoToken (Proof of Origin Token) jika IP server terkena deteksi bot ketat ("Sign in to confirm...")
+    # Jika diisi, Anda dapat mengubah clientOptions.WEB.playback menjadi true.
+    # pot:
+    #   token: "isi_potoken_di_sini"
+    #   visitorData: "isi_visitor_data_di_sini"
+
+    # OPSIONAL — OAuth2 YouTube (WAJIB gunakan akun BURNER/sekunder, JANGAN akun utama!)
+    # Hanya aktifkan dan tambahkan client TV jika IP Anda diblokir tanpa login.
+    oauth:
+      enabled: false
+      # refreshToken: "isi_jika_sudah_pernah_login_device_code"
+      # skipInitialization: true
 
 lavalink:
   plugins:
-    # Snapshot youtube-plugin terbaru untuk Lavalink v4
     - dependency: "dev.lavalink.youtube:youtube-plugin:2be8e542d3f6f178e048dca565892684c2e40177"
       snapshot: true
-    # Opsional: Aktifkan LavaSrc di bawah ini jika ingin pencocokan Spotify langsung di sisi Lavalink
-    # - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.3.0"
+    # Opsional: Aktifkan LavaSrc 4.8.3 jika ingin sumber tambahan Deezer / Apple Music / SoundCloud tingkat lanjut
+    # - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
     #   snapshot: false
 
+  pluginsDir: "./plugins"
+  defaultPluginRepository: "https://maven.lavalink.dev/releases"
+  defaultPluginSnapshotRepository: "https://maven.lavalink.dev/snapshots"
+
   server:
-    password: "GANTI_DENGAN_PASSWORD_KUAT_ANDA"
-    sources:
-      youtube: false # Wajib false karena digantikan oleh youtube-plugin v4 di atas
-      bandcamp: true
-      soundcloud: true
-      twitch: true
-      vimeo: true
-      nico: false
-      http: true
-      local: false
-    filters:
-      volume: true
-      equalizer: true
-      karaoke: true
-      timescale: true
-      tremolo: true
-      vibrato: true
-      distortion: true
-      rotation: true
-      channelMix: true
-      lowPass: true
-    # bufferDurationMs: 0 menonaktifkan JDA-NAS (libudpqueue.so) agar bare Termux Bionic tidak
-    # memunculkan UnsatisfiedLinkError saat startup. Jika menjalankan Lavalink di dalam
-    # proot-distro Debian (glibc), Anda boleh mengubahnya menjadi 400.
+    password: "masukkan_password_lavalink_anda_di_sini"
+
+    # PENTING UNTUK TERMUX ARM64 BIONIC:
+    # bufferDurationMs: 0 menonaktifkan JDA-NAS native (libudpqueue.so) pada Bionic murni.
+    # Script ./scripts/start-lavalink-termux.sh otomatis mengoptimalkan nilai ini ke 400ms di dalam glibc.
     bufferDurationMs: 0
     frameBufferDurationMs: 5000
     opusEncodingQuality: 10
@@ -89,14 +92,26 @@ lavalink:
     trackStuckThresholdMs: 10000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
-    playerUpdateInterval: 2
+    playerUpdateInterval: 5
     youtubeSearchEnabled: true
     soundcloudSearchEnabled: true
     gc-warnings: true
 
+    sources:
+      youtube: false # WAJIB false pada Lavalink v4 karena digantikan oleh youtube-plugin v2 di atas!
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+
 metrics:
   prometheus:
     enabled: false
+
+sentry:
+  dsn: ""
 
 logging:
   file:
@@ -105,3 +120,4 @@ logging:
     root: INFO
     lavalink: INFO
     dev.lavalink.youtube: INFO
+    moe.kyokobot.koe: INFO

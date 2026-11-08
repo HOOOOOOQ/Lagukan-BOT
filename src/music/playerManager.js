@@ -93,12 +93,15 @@ class PlayerManager {
    * sekaligus menyediakan diagnostik status voice.
    */
   ensureCleanLocalVoiceAdapter(guildId) {
-    const localConn = getVoiceConnection(String(guildId));
-    if (localConn && localConn.state.status !== VoiceConnectionStatus.Destroyed) {
-      try {
-        localConn.destroy();
-      } catch {
-        // Abaikan jika sudah tertutup
+    const id = String(guildId);
+    for (const group of ['default', `lagukan-dave-${id}`]) {
+      const localConn = getVoiceConnection(id, group);
+      if (localConn && localConn.state.status !== VoiceConnectionStatus.Destroyed) {
+        try {
+          localConn.destroy();
+        } catch {
+          // Abaikan jika sudah tertutup
+        }
       }
     }
   }
@@ -171,6 +174,13 @@ class PlayerManager {
     if (existing && !existing.destroyed) {
       if (textChannelId) {
         existing.textChannelId = String(textChannelId);
+      }
+      if (
+        existing.usingDirectDaveVoice &&
+        existing.directVoiceSession &&
+        !existing.directVoiceSession.destroyed
+      ) {
+        return existing;
       }
       const existingConn = this.client.shoukaku?.connections?.get(guildId);
       const connAlive =

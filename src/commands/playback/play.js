@@ -14,11 +14,11 @@ module.exports = {
   category: 'playback',
   data: new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Putar lagu atau playlist dari YouTube, Spotify, SoundCloud, URL audio, atau judul lagu')
+    .setDescription('Putar lagu atau playlist dari YouTube, Spotify, SoundCloud, Bandcamp, URL audio, atau judul lagu')
     .addStringOption((opt) =>
       opt
         .setName('lagu')
-        .setDescription('Judul lagu, nama artis, atau URL (YouTube / YT Music / Spotify / SoundCloud / Audio)')
+        .setDescription('Judul lagu, nama artis, atau URL (YouTube / YT Music / Spotify / SoundCloud / Bandcamp / Audio)')
         .setRequired(true)
         .setMaxLength(500)
     ),
@@ -104,7 +104,9 @@ module.exports = {
       const activeTrack = startRes.track || track;
       const title = escapeMarkdownLinkText(truncate(activeTrack.info.title, 120));
       const link = activeTrack.info.uri ? `[${title}](${activeTrack.info.uri})` : `**${title}**`;
-      const fallbackNote = startRes.usedFallback
+      const fallbackNote = startRes.usedDirectDave
+        ? `\n🔐 *Stream diputar melalui engine **Direct DAVE E2EE v1** (\`${activeTrack.info.sourceName}\`) agar suara tetap keluar terenkripsi penuh.*`
+        : startRes.usedFallback
         ? `\n🔄 *Stream dialihkan otomatis ke **${activeTrack.info.sourceName}** agar audio tetap jernih tanpa kendala dekode.*`
         : '';
 

@@ -3,6 +3,7 @@
 const { QueueManager } = require('./queueManager');
 const { getFilterPreset } = require('./filters');
 const { findAutoplayTrack } = require('./autoplay');
+const { DirectDaveVoiceSession } = require('./directVoiceEngine');
 const {
   buildMusicPlayerPayload,
   buildErrorEmbed,
@@ -46,11 +47,16 @@ class MusicPlayer {
     this.state = 'IDLE';
     this.destroyed = false;
 
-    // Telemetry transport suara Discord (UDP / Koe / paket RTP Opus)
+    // Telemetry transport suara Discord (UDP / Koe / Direct DAVE v1 / paket RTP Opus)
     this.voiceConnected = false;
     this.voicePingMs = -1;
     this.audioPacketsSent = false;
     this._lastPacketLogAt = 0;
+    this._lastVoiceCloseCode = null;
+    this.usingDirectDaveVoice = false;
+    /** @type {DirectDaveVoiceSession | null} */
+    this.directVoiceSession = null;
+    this._allowLoopbackDirectVoice = false;
 
     const savedVol = Number(guildSettings?.default_volume ?? config.music.defaultVolume);
     this.volume = savedVol > 0 ? savedVol : config.music.defaultVolume;
@@ -226,6 +232,10 @@ class MusicPlayer {
         return { ok: false, cancelled: true };
       }
 
+      if (this._lastVoiceCloseCode === 4017) {
+        return { ok: false, closeCode: 4017 };
+      }
+
       if (this.voiceConnected) {
         return { ok: true, ping: this.voicePingMs };
       }
@@ -311,6 +321,11 @@ class MusicPlayer {
 
   getCurrentPosition() {
     if (!this.currentTrack) return 0;
+    if (this.usingDirectDaveVoice && this.directVoiceSession) {
+      const directPos = this.lastPosition + this.directVoiceSession.getPlaybackPositionMs();
+      const maxLen = Number(this.currentTrack.info?.length || 0);
+      return maxLen > 0 && !this.currentTrack.info?.isStream ? Math.min(maxLen, directPos) : directPos;
+    }
     if (this.paused || !this.trackStarted || !this.lastPositionTimestamp) {
       return this.lastPosition;
     }
@@ -551,6 +566,7 @@ class MusicPlayer {
     this.playing = true;
     this.trackStarted = false;
     this.audioPacketsSent = false;
+    this._lastVoiceCloseCode = null;
     this._setState(
       resolvedTrack.fallbackFrom ? 'FALLBACK' : 'LOADING',
       `memuat "${resolvedTrack.info?.title || 'track'}"`
@@ -558,6 +574,30 @@ class MusicPlayer {
     this.lastException = null;
     this.lastPosition = startPositionMs;
     this.lastPositionTimestamp = Date.now();
+
+    // Jika sesi ini sudah berada pada mode Direct DAVE Voice (akibat Lavalink terkena Close 4017 pada Bionic),
+    // putar langsung melalui DirectDaveVoiceSession tanpa kembali ke Koe yang rusak!
+    if (this.usingDirectDaveVoice && this.directVoiceSession) {
+      const directOk = await this._tryDirectDaveVoiceFallback(resolvedTrack);
+      if (directOk) {
+        return {
+          started: true,
+          track: this.currentTrack,
+          usedFallback: Boolean(this.currentTrack?.fallbackFrom),
+          usedDirectDave: true
+        };
+      }
+      this.currentTrack = null;
+      this.playing = false;
+      this.trackStarted = false;
+      this._setState('IDLE', 'direct dave stream gagal');
+      const err = new AppError(
+        ErrorCodes.TRACK_PLAYBACK_FAILED,
+        `Gagal memuat stream langsung untuk **${resolvedTrack.info?.title || 'lagu'}** pada mode Direct DAVE Voice. Jalankan Lavalink melalui \`./scripts/start-lavalink-termux.sh\` untuk dukungan penuh semua sumber.`
+      );
+      this._resolvePendingStartWaiters({ started: false, error: err });
+      throw err;
+    }
 
     if (this.client.audioDiagnostics) {
       this.client.audioDiagnostics.recordStage(
@@ -686,7 +726,9 @@ class MusicPlayer {
       this.lastPositionTimestamp = 0;
       this.stopRefreshLoop();
 
-      if (skipped && this.player?.track) {
+      if (skipped && this.usingDirectDaveVoice && this.directVoiceSession) {
+        this.directVoiceSession.stopTrack();
+      } else if (skipped && this.player?.track) {
         this.suppressEndHandling = true;
         await this.player.stopTrack().catch(() => {});
       }
@@ -722,6 +764,96 @@ class MusicPlayer {
     }
   }
 
+  /**
+   * Menjalankan jembatan suara terenkripsi penuh @discordjs/voice + @snazzah/davey (DAVE Protocol v1)
+   * ketika Lavalink mengalami kegagalan libdave-jvm (Close 4017) pada Android Bionic.
+   */
+  async _tryDirectDaveVoiceFallback(trackToPlay) {
+    if (!config.music.enableDirectDaveFallback || this.destroyed || !trackToPlay) {
+      return false;
+    }
+
+    const guild = this.client.guilds?.cache?.get(this.guildId);
+    if (!guild || typeof guild.voiceAdapterCreator !== 'function') {
+      return false;
+    }
+
+    try {
+      if (!this.directVoiceSession || this.directVoiceSession.destroyed) {
+        this.directVoiceSession = new DirectDaveVoiceSession({
+          guild,
+          voiceChannelId: this.voiceChannelId,
+          client: this.client,
+          allowLoopback: Boolean(this._allowLoopbackDirectVoice),
+          onTrackEnd: (ev) => {
+            this.onTrackEnd(ev).catch((err) =>
+              logger.error('Error pada DirectDaveVoice onTrackEnd', err)
+            );
+          },
+          onTrackError: (err) => {
+            logger.warn(`[DirectDaveVoice][Guild ${this.guildId}] Stream error: ${err.message}`);
+            this.onTrackEnd({ reason: 'loadFailed' }).catch(() => {});
+          }
+        });
+      }
+
+      const directRes = await this.directVoiceSession.playTrack(trackToPlay, {
+        volume: this.volume
+      });
+
+      if (directRes?.started) {
+        this.usingDirectDaveVoice = true;
+        this.consecutiveFailures = 0;
+        this.playing = true;
+        this.paused = false;
+        this.trackStarted = true;
+        this.voiceConnected = true;
+        this.audioPacketsSent = true;
+        this.voicePingMs = typeof directRes.ping === 'number' ? directRes.ping : 0;
+        this.lastPosition = 0;
+        this.lastPositionTimestamp = Date.now();
+        this._setState(
+          'PLAYING',
+          `Direct DAVE E2EE v1 aktif (${directRes.container}, packets=${directRes.packetsSent})`
+        );
+
+        if (this.client.audioDiagnostics) {
+          this.client.audioDiagnostics.recordStage(
+            this.guildId,
+            8,
+            'Transmisi Audio Direct DAVE E2EE v1 (@snazzah/davey) Aktif',
+            `judul="${trackToPlay.info?.title}", container=${directRes.container}, packets=${directRes.packetsSent}`
+          );
+          this.client.audioDiagnostics.recordStage(
+            this.guildId,
+            9,
+            'Panel Now Playing Aktif Ditampilkan',
+            `judul="${trackToPlay.info?.title}" [Direct DAVE v1]`
+          );
+        }
+
+        this._resolvePendingStartWaiters({
+          started: true,
+          track: this.currentTrack,
+          usedFallback: true,
+          usedDirectDave: true
+        });
+
+        await this.sendFreshPlayerMessage();
+        this.startRefreshLoop();
+        return true;
+      }
+    } catch (err) {
+      logger.warn(
+        `[DirectDaveVoice][Guild ${this.guildId}] Fallback Direct DAVE tidak dapat memutar "${
+          trackToPlay.info?.title || 'lagu'
+        }": ${err.message}`
+      );
+    }
+
+    return false;
+  }
+
   async onTrackStart() {
     const trackAtStart = this.currentTrack;
     const title = trackAtStart?.info?.title || 'Lagu';
@@ -740,14 +872,30 @@ class MusicPlayer {
       if (voiceCheck.cancelled || this.destroyed) return;
 
       logger.error(
-        `[VoiceUDP] ❌ Kegagalan koneksi suara Discord: Lavalink memulai dekode "${title}" tetapi state.connected=false (UDP/DAVE voice transport gagal, 0 paket audio terkirim ke Discord)!`
+        `[VoiceUDP] ❌ Kegagalan koneksi suara Discord pada Lavalink: "${title}" state.connected=false (closeCode=${
+          voiceCheck.closeCode || this._lastVoiceCloseCode || 'none'
+        })!`
       );
 
-      // Hentikan stream bisu di Lavalink agar bot TIDAK berpura-pura memutar lagu atau menghabiskan antrean tanpa suara!
+      // Hentikan stream bisu di Lavalink terlebih dahulu
       if (this.player) {
         this.suppressEndHandling = true;
         await this.player.stopTrack().catch(() => {});
       }
+
+      const isClose4017 =
+        voiceCheck.closeCode === 4017 || this._lastVoiceCloseCode === 4017;
+
+      // Coba jembatan suara Direct DAVE E2EE v1 (@discordjs/voice + @snazzah/davey ARM64)
+      // apabila track memiliki stream langsung yang sah & guild adapter tersedia!
+      const recoveredViaDirectDave = await this._tryDirectDaveVoiceFallback(trackAtStart);
+      if (recoveredViaDirectDave) {
+        return;
+      }
+
+      const rawVoiceReason = isClose4017
+        ? 'Discord Voice Close 4017 (DAVE protocol required — libdave-jvm missing on Bionic)'
+        : 'VOICE_TRANSPORT_NOT_CONNECTED: UDP/Discord Voice transport failed (state.connected=false)';
 
       const diagnosis = this.client.audioDiagnostics
         ? this.client.audioDiagnostics.recordTrackError({
@@ -755,8 +903,7 @@ class MusicPlayer {
             nodeName: this.player?.node?.name,
             track: trackAtStart,
             stage: 'VOICE_UDP_TRANSPORT',
-            rawException:
-              'VOICE_TRANSPORT_NOT_CONNECTED: UDP/Discord Voice transport failed (state.connected=false)'
+            rawException: rawVoiceReason
           })
         : null;
 
@@ -775,12 +922,17 @@ class MusicPlayer {
 
       if (!hadWaiter && diagnosis?.userMessage) {
         await this.sendChannelEmbed(
-          buildErrorEmbed('Koneksi Suara UDP Discord Gagal', diagnosis.userMessage)
+          buildErrorEmbed('Koneksi Suara UDP / DAVE Discord Gagal', diagnosis.userMessage)
         );
       }
 
       this.startIdleTimer();
       return;
+    }
+
+    // Jika YouTube berhasil diputar penuh sampai ke voice Discord, bersihkan status circuit-breaker YouTube!
+    if (/^youtube/i.test(source) && this.client.audioDiagnostics) {
+      this.client.audioDiagnostics.clearYoutubeDegraded(this.player?.node?.name);
     }
 
     this.consecutiveFailures = 0;
@@ -989,20 +1141,48 @@ class MusicPlayer {
 
   async onTrackStuck(event) {
     const threshold = event?.thresholdMs || 10000;
+    const stuckTrack = this.currentTrack;
     logger.warn(
       `[TrackStuck] ⚠️ Track stuck: guild=${this.guildId}, track="${
-        this.currentTrack?.info?.title || 'unknown'
+        stuckTrack?.info?.title || 'unknown'
       }", thresholdMs=${threshold}ms`
     );
     if (this.client.audioDiagnostics) {
       this.client.audioDiagnostics.recordTrackError({
         guildId: this.guildId,
         nodeName: this.player?.node?.name,
-        track: this.currentTrack,
+        track: stuckTrack,
         stage: 'TRACK_STUCK',
         rawException: `Audio stream stuck > ${threshold}ms`
       });
     }
+
+    // Coba alihkan lagu yang macet ke sumber alternatif (SoundCloud / Bandcamp) sebelum melewati lagu!
+    if (
+      stuckTrack &&
+      this.player?.node &&
+      typeof this.client.sourceResolver?.findFallbackTrack === 'function'
+    ) {
+      const fallbackTrack = await this.client.sourceResolver
+        .findFallbackTrack(this.player.node, stuckTrack)
+        .catch(() => null);
+      if (fallbackTrack?.encoded) {
+        logger.info(
+          `[TrackStuck][Guild ${this.guildId}] Memulihkan stream macet "${stuckTrack.info?.title}" -> sumber alternatif "${fallbackTrack.info?.sourceName}".`
+        );
+        try {
+          if (this.player?.track) {
+            this.suppressEndHandling = true;
+            await this.player.stopTrack().catch(() => {});
+          }
+          await this.playSpecificTrack(fallbackTrack, { preserveWaiters: true });
+          return;
+        } catch (fbErr) {
+          logger.warn(`[TrackStuck][Guild ${this.guildId}] Pemulihan fallback gagal: ${fbErr.message}`);
+        }
+      }
+    }
+
     await this.sendChannelEmbed(
       buildErrorEmbed(
         'Aliran Audio Macet (Stuck)',
@@ -1016,6 +1196,7 @@ class MusicPlayer {
     const code = event?.code;
     const reason = event?.reason || 'unknown';
     this.voiceConnected = false;
+    this._lastVoiceCloseCode = code || null;
     logger.warn(
       `[VoiceState] Voice WebSocket closed: guild=${this.guildId}, code=${code}, reason=${reason}`
     );
@@ -1052,7 +1233,11 @@ class MusicPlayer {
 
     this.lastPosition = this.getCurrentPosition();
     this.lastPositionTimestamp = Date.now();
-    await this.player.setPaused(true);
+    if (this.usingDirectDaveVoice && this.directVoiceSession) {
+      this.directVoiceSession.setPaused(true);
+    } else {
+      await this.player.setPaused(true);
+    }
     this.paused = true;
     this._setState('PAUSED', 'dijeda pengguna');
     await this.updatePlayerMessage();
@@ -1071,7 +1256,11 @@ class MusicPlayer {
     }
 
     this.lastPositionTimestamp = Date.now();
-    await this.player.setPaused(false);
+    if (this.usingDirectDaveVoice && this.directVoiceSession) {
+      this.directVoiceSession.setPaused(false);
+    } else {
+      await this.player.setPaused(false);
+    }
     this.paused = false;
     this._setState(this.trackStarted ? 'PLAYING' : 'LOADING', 'dilanjutkan pengguna');
     await this.updatePlayerMessage();
@@ -1161,7 +1350,11 @@ class MusicPlayer {
       config.music.minVolume,
       Math.min(config.music.maxVolume, Math.round(Number(newVolume)))
     );
-    await this.player.setGlobalVolume(clamped);
+    if (this.usingDirectDaveVoice && this.directVoiceSession) {
+      this.directVoiceSession.setVolume(clamped);
+    } else {
+      await this.player.setGlobalVolume(clamped);
+    }
     this.volume = clamped;
     await this.updatePlayerMessage();
     return this.volume;
@@ -1216,7 +1409,10 @@ class MusicPlayer {
     this.stopRefreshLoop();
     this._resolvePendingStartWaiters({ started: false, cancelled: true });
 
-    if (hadTrack && this.player) {
+    if (this.directVoiceSession) {
+      this.directVoiceSession.stopTrack();
+    }
+    if (hadTrack && this.player && !this.usingDirectDaveVoice) {
       this.suppressEndHandling = true;
       await this.player.stopTrack().catch(() => {});
     }
@@ -1241,6 +1437,11 @@ class MusicPlayer {
     this.clearIdleTimer();
     this.clearEmptyChannelTimer();
     this._resolvePendingStartWaiters({ started: false, cancelled: true });
+    if (this.directVoiceSession) {
+      this.directVoiceSession.destroy();
+      this.directVoiceSession = null;
+    }
+    this.usingDirectDaveVoice = false;
     if (this.player) {
       this.player.removeAllListeners();
     }

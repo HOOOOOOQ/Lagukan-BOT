@@ -15,10 +15,10 @@ echo "=========================================================="
 echo "[1/5] Memperbarui repositori paket Termux..."
 pkg update -y && pkg upgrade -y
 
-echo "[2/5] Menginstal Node.js LTS, Git, OpenJDK 21, proot-distro, Tmux, dan Curl..."
-pkg install -y nodejs-lts git openjdk-21 proot-distro tmux curl
+echo "[2/5] Menginstal Node.js LTS, Git, OpenJDK 21, proot-distro, FFmpeg ARM64, Tmux, dan Curl..."
+pkg install -y nodejs-lts git openjdk-21 proot-distro ffmpeg tmux curl
 
-echo "[3/5] Menginstal dependency Node.js project LaguKan..."
+echo "[3/5] Menginstal dependency Node.js project LaguKan (kompatibel penuh ARM64)..."
 npm install
 
 if [ ! -f ".env" ]; then
@@ -32,7 +32,7 @@ fi
 chmod +x scripts/start-lavalink-termux.sh 2>/dev/null || true
 
 echo "[5/5] Informasi Server Audio Lavalink (Proses Java Terpisah):"
-echo "   Untuk dukungan penuh decoder native ARM64 (AAC/Opus/libdave) di Android Termux:"
+echo "   Untuk dukungan penuh enkripsi suara Discord DAVE E2EE (libdave-jvm) & decoder ARM64:"
 echo "   1. ./scripts/start-lavalink-termux.sh --setup-glibc"
 echo "   2. ./scripts/start-lavalink-termux.sh"
 
