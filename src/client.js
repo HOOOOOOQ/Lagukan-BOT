@@ -3,7 +3,15 @@
 const { Client, Collection, GatewayIntentBits } = require('discord.js');
 const { Shoukaku, Connectors } = require('shoukaku');
 const { config, validateConfig } = require('../config/config');
-const { lavalinkConfig, validateLavalinkConfig } = require('../config/lavalink');
+const {
+  lavalinkConfig,
+  getLavalinkNodes,
+  validateLavalinkConfig
+} = require('../config/lavalink');
+const {
+  installShoukakuPatches,
+  attachNodeMetadata
+} = require('./music/lavalinkTransport');
 const { DatabaseManager } = require('./database/database');
 const { GuildRepository } = require('./database/guildRepository');
 const { PlaylistRepository } = require('./database/playlistRepository');
@@ -24,6 +32,9 @@ class LaguKanClient extends Client {
       ]
     });
 
+    // Pasang perbaikan low-level Shoukaku (connectError bug, HTTP 401 auth handler, & voice handshake race fix)
+    installShoukakuPatches();
+
     this.commands = new Collection();
     this.bootTimestamp = Date.now();
 
@@ -33,7 +44,8 @@ class LaguKanClient extends Client {
     this.audioDiagnostics = new AudioDiagnostics();
     this.sourceResolver = new SourceResolver(this.audioDiagnostics);
 
-    const shoukakuNodes = lavalinkConfig.nodes.map((n) => ({
+    const nodes = getLavalinkNodes();
+    const shoukakuNodes = nodes.map((n) => ({
       name: n.name,
       url: n.url,
       auth: n.auth || 'missing_password',
@@ -46,10 +58,15 @@ class LaguKanClient extends Client {
       lavalinkConfig.shoukakuOptions
     );
 
+    this.once('clientReady', () => {
+      attachNodeMetadata(this.shoukaku, getLavalinkNodes());
+    });
+
     this.playerManager = new PlayerManager(this);
     this.presenceInterval = null;
     this.lavalinkHealthTimer = null;
     this.initialized = false;
+    this.shuttingDown = false;
   }
 
   async init() {
@@ -69,9 +86,12 @@ class LaguKanClient extends Client {
       );
     }
 
-    const lavalinkCheck = validateLavalinkConfig(lavalinkConfig);
-    if (!lavalinkCheck.valid) {
-      for (const issue of lavalinkCheck.issues) {
+    const freshLavalinkCheck = validateLavalinkConfig({
+      ...lavalinkConfig,
+      nodes: getLavalinkNodes()
+    });
+    if (!freshLavalinkCheck.valid) {
+      for (const issue of freshLavalinkCheck.issues) {
         logger.warn(issue);
       }
     }
@@ -82,6 +102,7 @@ class LaguKanClient extends Client {
   }
 
   async shutdown(signal = 'SIGTERM') {
+    this.shuttingDown = true;
     logger.info(`Menerima sinyal ${signal}. Menutup ${config.bot.name} dengan aman...`);
 
     if (this.presenceInterval) {
@@ -100,6 +121,20 @@ class LaguKanClient extends Client {
       await this.playerManager.destroyAll();
     } catch (err) {
       logger.warn('Kendala ringan saat menutup sesi pemutar musik', err);
+    }
+
+    // Tutup seluruh koneksi WebSocket node Lavalink agar proses berhenti seketika tanpa loop reconnect
+    if (this.shoukaku?.nodes) {
+      for (const node of this.shoukaku.nodes.values()) {
+        try {
+          node._shuttingDown = true;
+          node.cleanupWebsocket();
+          node.removeAllListeners();
+        } catch {
+          // Abaikan
+        }
+      }
+      this.shoukaku.nodes.clear();
     }
 
     this.db.close();

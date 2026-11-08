@@ -12,6 +12,13 @@ const { AppError, ErrorCodes } = require('../utils/errorHandler');
 const logger = require('../utils/logger').child('MusicPlayer');
 const { config } = require('../../config/config');
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === 'function') t.unref();
+  });
+}
+
 class MusicPlayer {
   /**
    * @param {object} options
@@ -39,7 +46,14 @@ class MusicPlayer {
     this.state = 'IDLE';
     this.destroyed = false;
 
-    this.volume = Number(guildSettings?.default_volume ?? config.music.defaultVolume);
+    // Telemetry transport suara Discord (UDP / Koe / paket RTP Opus)
+    this.voiceConnected = false;
+    this.voicePingMs = -1;
+    this.audioPacketsSent = false;
+    this._lastPacketLogAt = 0;
+
+    const savedVol = Number(guildSettings?.default_volume ?? config.music.defaultVolume);
+    this.volume = savedVol > 0 ? savedVol : config.music.defaultVolume;
     this.twentyFourSeven = Boolean(guildSettings?.twenty_four_seven);
     this.autoplay = Boolean(guildSettings?.autoplay);
 
@@ -65,6 +79,18 @@ class MusicPlayer {
     this.bindPlayerEvents(this.player);
   }
 
+  _setState(newState, reason = '') {
+    const prev = this.state;
+    this.state = newState;
+    if (prev !== newState) {
+      logger.info(
+        `[PlayerState] Audio player state: guild=${this.guildId}, ${prev} -> ${newState}${
+          reason ? ` (${reason})` : ''
+        }`
+      );
+    }
+  }
+
   /**
    * Menentukan apakah player terhubung ke sesi WebSocket Lavalink nyata (asynchronous TrackStartEvent)
    * atau mock sinkron pada pengujian unit ringan.
@@ -74,6 +100,17 @@ class MusicPlayer {
       this.player?.node?.ws ||
       this.player?.node?.sessionId ||
       this.player?._asyncLifecycle
+    );
+  }
+
+  /**
+   * Menentukan apakah node mendukung inspeksi transport suara Lavalink secara real-time
+   * (selalu true pada node Shoukaku nyata yang memiliki WebSocket atau REST getPlayer).
+   */
+  hasLiveVoiceTransportCheck() {
+    return Boolean(
+      this.player?.node?.ws ||
+      typeof this.player?.node?.rest?.getPlayer === 'function'
     );
   }
 
@@ -101,10 +138,7 @@ class MusicPlayer {
     });
 
     shoukakuPlayer.on('update', (data) => {
-      if (data?.state) {
-        this.lastPosition = Number(data.state.position || 0);
-        this.lastPositionTimestamp = Date.now();
-      }
+      this.onPlayerUpdate(data);
     });
 
     shoukakuPlayer.on('resumed', () => {
@@ -112,10 +146,131 @@ class MusicPlayer {
     });
   }
 
+  onPlayerUpdate(data) {
+    if (!data?.state) return;
+
+    this.lastPosition = Number(data.state.position || 0);
+    this.lastPositionTimestamp = Date.now();
+
+    const connected = Boolean(data.state.connected);
+    const ping = typeof data.state.ping === 'number' ? data.state.ping : -1;
+    this.voicePingMs = ping;
+
+    if (connected && !this.voiceConnected) {
+      this.voiceConnected = true;
+      logger.info(
+        `[VoiceUDP] ✅ UDP connection established: guild=${this.guildId}, connected=true, ping=${ping}ms`
+      );
+    }
+
+    if (connected && this.playing && !this.paused) {
+      const frameStats = this.player?.node?.stats?.frameStats || null;
+      const now = Date.now();
+      if (!this.audioPacketsSent || now - this._lastPacketLogAt >= 15000) {
+        this.audioPacketsSent = true;
+        this._lastPacketLogAt = now;
+        logger.info(
+          `[AudioTx] 📡 Audio packet transmission: guild=${this.guildId}, pos=${this.lastPosition}ms, ping=${ping}ms, framesSent=${
+            frameStats ? frameStats.sent : 'streaming'
+          }, nulled=${frameStats ? frameStats.nulled : 0}, deficit=${frameStats ? frameStats.deficit : 0}`
+        );
+      }
+    } else if (!connected && this.voiceConnected) {
+      this.voiceConnected = false;
+      logger.warn(
+        `[VoiceUDP] ⚠️ Transport suara UDP terputus sementara (guild=${this.guildId}, state.connected=false)`
+      );
+      if (this.playing && !this.paused) {
+        this._resyncVoiceSessionToLavalink().catch(() => {});
+      }
+    }
+  }
+
+  async _resyncVoiceSessionToLavalink() {
+    const conn = this.client.shoukaku?.connections?.get(this.guildId);
+    if (
+      conn?.sessionId &&
+      conn?.serverUpdate?.token &&
+      conn?.serverUpdate?.endpoint &&
+      typeof this.player?.sendServerUpdate === 'function'
+    ) {
+      logger.info(
+        `[DiscordVoice] Mengirim ulang kredensial sesi voice ke Lavalink (guild=${this.guildId}, channel=${
+          conn.channelId || this.voiceChannelId
+        })...`
+      );
+      await this.player.sendServerUpdate(conn);
+    }
+  }
+
+  /**
+   * Memastikan koneksi UDP & Discord Voice Gateway pada sisi Lavalink benar-benar terhubung
+   * (state.connected === true) sebelum mengizinkan status berubah menjadi PLAYING.
+   */
+  async _verifyVoiceTransportReady() {
+    if (!this.hasLiveVoiceTransportCheck()) {
+      return { ok: true, skipped: true };
+    }
+
+    if (this.voiceConnected) {
+      return { ok: true, ping: this.voicePingMs };
+    }
+
+    const timeoutMs = Number(process.env.VOICE_TRANSPORT_VERIFY_TIMEOUT_MS || 4000);
+    const pollIntervalMs = 200;
+    const startedAt = Date.now();
+    let resynced = false;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      if (this.destroyed || !this.playing) {
+        return { ok: false, cancelled: true };
+      }
+
+      if (this.voiceConnected) {
+        return { ok: true, ping: this.voicePingMs };
+      }
+
+      if (typeof this.player?.node?.rest?.getPlayer === 'function') {
+        const remotePlayer = await this.player.node.rest.getPlayer(this.guildId).catch(() => null);
+        if (remotePlayer?.state?.connected === true) {
+          this.voiceConnected = true;
+          this.voicePingMs =
+            typeof remotePlayer.state.ping === 'number' ? remotePlayer.state.ping : -1;
+          this.lastPosition = Number(remotePlayer.state.position || this.lastPosition);
+          this.lastPositionTimestamp = Date.now();
+          this.audioPacketsSent = true;
+          this._lastPacketLogAt = Date.now();
+
+          const frameStats = this.player?.node?.stats?.frameStats || null;
+          logger.info(
+            `[VoiceUDP] ✅ UDP connection established: guild=${this.guildId}, connected=true, ping=${this.voicePingMs}ms`
+          );
+          logger.info(
+            `[AudioTx] 📡 Audio packet transmission: guild=${this.guildId}, pos=${this.lastPosition}ms, ping=${this.voicePingMs}ms, framesSent=${
+              frameStats ? frameStats.sent : 'streaming'
+            }, nulled=${frameStats ? frameStats.nulled : 0}, deficit=${frameStats ? frameStats.deficit : 0}`
+          );
+          return { ok: true, ping: this.voicePingMs };
+        }
+      }
+
+      if (!resynced && Date.now() - startedAt >= 800) {
+        resynced = true;
+        await this._resyncVoiceSessionToLavalink().catch(() => {});
+      }
+
+      await sleep(pollIntervalMs);
+    }
+
+    return { ok: false };
+  }
+
   attachNewShoukakuPlayer(newShoukakuPlayer) {
     if (this.player && this.player !== newShoukakuPlayer) {
       this.player.removeAllListeners();
     }
+    this.voiceConnected = false;
+    this.audioPacketsSent = false;
     this.player = newShoukakuPlayer;
     this.bindPlayerEvents(newShoukakuPlayer);
   }
@@ -293,7 +448,7 @@ class MusicPlayer {
   }
 
   async sendFreshPlayerMessage() {
-    // JANGAN PERNAH mengirim panel Now Playing sebelum track benar-benar mulai diputar!
+    // JANGAN PERNAH mengirim panel Now Playing sebelum track & transport suara benar-benar aktif!
     if (!this.currentTrack || !this.trackStarted) return null;
 
     await this.disableOldPlayerMessage();
@@ -340,8 +495,8 @@ class MusicPlayer {
 
   /**
    * Memulai pemutaran satu lagu spesifik pada Lavalink.
-   * Mendukung mode waitForStart agar perintah /play dapat menunggu konfirmasi nyata TrackStartEvent
-   * (serta menangani fallback otomatis apabila track pertama gagal didekode).
+   * Mendukung mode waitForStart agar perintah /play menunggu konfirmasi nyata TrackStartEvent
+   * DAN verifikasi koneksi UDP voice transport sebelum menyatakan musik aktif.
    */
   async playSpecificTrack(
     track,
@@ -364,6 +519,19 @@ class MusicPlayer {
       );
     }
 
+    // Pastikan koneksi voice Discord tidak dalam keadaan self-mute
+    const conn = this.client.shoukaku?.connections?.get(this.guildId);
+    if (conn?.muted && typeof conn.setMute === 'function') {
+      conn.setMute(false);
+    }
+
+    if (this.volume === 0) {
+      logger.warn(
+        `[PlayerState] ⚠️ Volume pemutar di guild=${this.guildId} bernilai 0%! Memulihkan ke ${config.music.defaultVolume}% agar audio terdengar.`
+      );
+      this.volume = config.music.defaultVolume;
+    }
+
     // Jika node Lavalink terdeteksi berjalan pada Android Bionic tanpa decoder JNI glibc,
     // pastikan volume dikunci ke 100% dan filter dinonaktifkan agar Pure-Java Opus Passthrough bekerja.
     const nodeName = this.player?.node?.name;
@@ -382,7 +550,11 @@ class MusicPlayer {
     this.paused = false;
     this.playing = true;
     this.trackStarted = false;
-    this.state = resolvedTrack.fallbackFrom ? 'FALLBACK' : 'LOADING';
+    this.audioPacketsSent = false;
+    this._setState(
+      resolvedTrack.fallbackFrom ? 'FALLBACK' : 'LOADING',
+      `memuat "${resolvedTrack.info?.title || 'track'}"`
+    );
     this.lastException = null;
     this.lastPosition = startPositionMs;
     this.lastPositionTimestamp = Date.now();
@@ -425,7 +597,7 @@ class MusicPlayer {
       this.currentTrack = null;
       this.playing = false;
       this.trackStarted = false;
-      this.state = 'IDLE';
+      this._setState('IDLE', 'playTrack gagal');
       this._resolvePendingStartWaiters({ started: false, error: err });
       throw err;
     }
@@ -446,7 +618,7 @@ class MusicPlayer {
     // Untuk stub sinkron di unit test tanpa sesi WebSocket Lavalink nyata
     if (!this.isAsyncLavalinkSession()) {
       this.trackStarted = true;
-      this.state = 'PLAYING';
+      this._setState('PLAYING', 'stub sinkron unit test');
       this._resolvePendingStartWaiters({
         started: true,
         track: this.currentTrack,
@@ -509,7 +681,7 @@ class MusicPlayer {
       this.playing = false;
       this.paused = false;
       this.trackStarted = false;
-      this.state = 'IDLE';
+      this._setState('IDLE', 'antrean selesai');
       this.lastPosition = 0;
       this.lastPositionTimestamp = 0;
       this.stopRefreshLoop();
@@ -542,7 +714,7 @@ class MusicPlayer {
       this.currentTrack = null;
       this.playing = false;
       this.trackStarted = false;
-      this.state = 'IDLE';
+      this._setState('IDLE', 'batas kegagalan beruntun tercapai');
       this.stopRefreshLoop();
       await this.updatePlayerMessage({ ended: true });
       this.startIdleTimer();
@@ -551,11 +723,71 @@ class MusicPlayer {
   }
 
   async onTrackStart() {
+    const trackAtStart = this.currentTrack;
+    const title = trackAtStart?.info?.title || 'Lagu';
+    const source = trackAtStart?.info?.sourceName || 'audio';
+
+    logger.info(
+      `[TrackStart] 🎵 Track playback started: guild=${this.guildId}, title="${title}", source=${source}, volume=${this.volume}%`
+    );
+
+    if (this.hasLiveVoiceTransportCheck()) {
+      this._setState('VERIFYING_VOICE', 'verifikasi koneksi UDP & paket suara Discord');
+    }
+
+    const voiceCheck = await this._verifyVoiceTransportReady();
+    if (!voiceCheck.ok) {
+      if (voiceCheck.cancelled || this.destroyed) return;
+
+      logger.error(
+        `[VoiceUDP] ❌ Kegagalan koneksi suara Discord: Lavalink memulai dekode "${title}" tetapi state.connected=false (UDP/DAVE voice transport gagal, 0 paket audio terkirim ke Discord)!`
+      );
+
+      // Hentikan stream bisu di Lavalink agar bot TIDAK berpura-pura memutar lagu atau menghabiskan antrean tanpa suara!
+      if (this.player) {
+        this.suppressEndHandling = true;
+        await this.player.stopTrack().catch(() => {});
+      }
+
+      const diagnosis = this.client.audioDiagnostics
+        ? this.client.audioDiagnostics.recordTrackError({
+            guildId: this.guildId,
+            nodeName: this.player?.node?.name,
+            track: trackAtStart,
+            stage: 'VOICE_UDP_TRANSPORT',
+            rawException:
+              'VOICE_TRANSPORT_NOT_CONNECTED: UDP/Discord Voice transport failed (state.connected=false)'
+          })
+        : null;
+
+      this.playing = false;
+      this.trackStarted = false;
+      this.currentTrack = null;
+      this._setState('VOICE_ERROR', 'state.connected=false (0 paket audio terkirim)');
+      this.stopRefreshLoop();
+
+      const hadWaiter = this._pendingStartWaiters.length > 0;
+      this._resolvePendingStartWaiters({
+        started: false,
+        failedTrack: trackAtStart,
+        diagnosis
+      });
+
+      if (!hadWaiter && diagnosis?.userMessage) {
+        await this.sendChannelEmbed(
+          buildErrorEmbed('Koneksi Suara UDP Discord Gagal', diagnosis.userMessage)
+        );
+      }
+
+      this.startIdleTimer();
+      return;
+    }
+
     this.consecutiveFailures = 0;
     this.playing = true;
     this.paused = false;
     this.trackStarted = true;
-    this.state = 'PLAYING';
+    this._setState('PLAYING', 'audio aktif terkirim ke Discord Voice Channel');
     this.lastPositionTimestamp = Date.now();
 
     if (this.client.audioDiagnostics) {
@@ -563,13 +795,13 @@ class MusicPlayer {
         this.guildId,
         8,
         'Transmisi Audio ke Discord Voice Gateway Aktif',
-        `judul="${this.currentTrack?.info?.title || 'Lagu'}"`
+        `judul="${title}", udpConnected=${this.voiceConnected}, ping=${this.voicePingMs}ms`
       );
       this.client.audioDiagnostics.recordStage(
         this.guildId,
         9,
         'Panel Now Playing Aktif Ditampilkan',
-        `judul="${this.currentTrack?.info?.title || 'Lagu'}" [${this.currentTrack?.info?.sourceName || 'audio'}]`
+        `judul="${title}" [${source}]`
       );
     }
 
@@ -697,7 +929,7 @@ class MusicPlayer {
         this.currentTrack = null;
         this.playing = false;
         this.trackStarted = false;
-        this.state = 'IDLE';
+        this._setState('IDLE', 'gagal memuat lagu');
         this.stopRefreshLoop();
         await this.updatePlayerMessage({ ended: true });
         this.startIdleTimer();
@@ -736,8 +968,11 @@ class MusicPlayer {
     };
 
     const msg = rawExc?.message || rawExc?.cause || 'Kesalahan dekode audio';
+    const severity = rawExc?.severity || 'COMMON';
     logger.warn(
-      `[Guild ${this.guildId}] TrackException [${diagnosis?.code || 'ERROR'}]: ${msg}${
+      `[TrackException] ❌ Track exception: guild=${this.guildId}, track="${
+        this.currentTrack?.info?.title || 'unknown'
+      }", severity=${severity}, code=${diagnosis?.code || 'ERROR'}, message=${msg}${
         rawExc?.cause ? ` | Cause: ${rawExc.cause}` : ''
       }`
     );
@@ -753,20 +988,25 @@ class MusicPlayer {
   }
 
   async onTrackStuck(event) {
-    logger.warn(`[Guild ${this.guildId}] TrackStuck (${event?.thresholdMs}ms), melewati otomatis.`);
+    const threshold = event?.thresholdMs || 10000;
+    logger.warn(
+      `[TrackStuck] ⚠️ Track stuck: guild=${this.guildId}, track="${
+        this.currentTrack?.info?.title || 'unknown'
+      }", thresholdMs=${threshold}ms`
+    );
     if (this.client.audioDiagnostics) {
       this.client.audioDiagnostics.recordTrackError({
         guildId: this.guildId,
         nodeName: this.player?.node?.name,
         track: this.currentTrack,
         stage: 'TRACK_STUCK',
-        rawException: `Audio stream stuck > ${event?.thresholdMs || 10000}ms`
+        rawException: `Audio stream stuck > ${threshold}ms`
       });
     }
     await this.sendChannelEmbed(
       buildErrorEmbed(
         'Aliran Audio Macet (Stuck)',
-        `Aliran audio terhenti lebih dari ${(event?.thresholdMs || 10000) / 1000} detik. Beralih ke lagu berikutnya...`
+        `Aliran audio terhenti lebih dari ${threshold / 1000} detik. Beralih ke lagu berikutnya...`
       )
     );
     await this.advanceQueue({ skipped: true });
@@ -775,8 +1015,9 @@ class MusicPlayer {
   async onWebSocketClosed(event) {
     const code = event?.code;
     const reason = event?.reason || 'unknown';
+    this.voiceConnected = false;
     logger.warn(
-      `[Guild ${this.guildId}] Voice WebSocket tertutup (code=${code}, reason=${reason})`
+      `[VoiceState] Voice WebSocket closed: guild=${this.guildId}, code=${code}, reason=${reason}`
     );
 
     if (code === 4017 && this.client.audioDiagnostics) {
@@ -813,7 +1054,7 @@ class MusicPlayer {
     this.lastPositionTimestamp = Date.now();
     await this.player.setPaused(true);
     this.paused = true;
-    this.state = 'PAUSED';
+    this._setState('PAUSED', 'dijeda pengguna');
     await this.updatePlayerMessage();
   }
 
@@ -832,7 +1073,7 @@ class MusicPlayer {
     this.lastPositionTimestamp = Date.now();
     await this.player.setPaused(false);
     this.paused = false;
-    this.state = this.trackStarted ? 'PLAYING' : 'LOADING';
+    this._setState(this.trackStarted ? 'PLAYING' : 'LOADING', 'dilanjutkan pengguna');
     await this.updatePlayerMessage();
   }
 
@@ -968,7 +1209,8 @@ class MusicPlayer {
     this.playing = false;
     this.paused = false;
     this.trackStarted = false;
-    this.state = 'STOPPED';
+    this.audioPacketsSent = false;
+    this._setState('STOPPED', 'dihentikan pengguna');
     this.lastPosition = 0;
     this.lastPositionTimestamp = 0;
     this.stopRefreshLoop();
@@ -986,13 +1228,15 @@ class MusicPlayer {
       return { stayedInChannel: false };
     }
 
-    this.state = 'IDLE';
+    this._setState('IDLE', 'mode 24/7 tetap di channel');
     return { stayedInChannel: true };
   }
 
   cleanupTimersAndListeners() {
     this.destroyed = true;
-    this.state = 'DESTROYED';
+    this.voiceConnected = false;
+    this.audioPacketsSent = false;
+    this._setState('DESTROYED', 'sesi dibersihkan');
     this.stopRefreshLoop();
     this.clearIdleTimer();
     this.clearEmptyChannelTimer();

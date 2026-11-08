@@ -10,16 +10,17 @@ module.exports = {
   once: true,
 
   async execute(readyClient, client) {
+    const activeClient = readyClient || client;
     logger.info(
-      `✅ ${config.bot.name} v${config.bot.version} berhasil login sebagai ${readyClient.user.tag}!`
+      `✅ ${config.bot.name} v${config.bot.version} berhasil login sebagai ${activeClient.user?.tag || 'Bot'}!`
     );
     logger.info(
-      `Developer: ${config.bot.developer} | Server terhubung: ${readyClient.guilds.cache.size} | Slash Commands: ${client.commands.size}`
+      `Developer: ${config.bot.developer} | Server terhubung: ${activeClient.guilds.cache.size} | Slash Commands: ${client.commands.size}`
     );
 
     const updatePresence = () => {
       try {
-        readyClient.user.setPresence({
+        activeClient.user?.setPresence?.({
           activities: [
             {
               name: `/play • ${config.bot.name} | ${config.bot.developer}`,

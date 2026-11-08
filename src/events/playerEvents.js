@@ -1,7 +1,7 @@
 'use strict';
 
-const { Constants } = require('shoukaku');
 const { lavalinkConfig } = require('../../config/lavalink');
+const { syncAndHealLavalinkNodes } = require('../music/lavalinkTransport');
 const logger = require('../utils/logger').child('Lavalink');
 
 module.exports = {
@@ -11,10 +11,15 @@ module.exports = {
 
     shoukaku.on('ready', async (name, lavalinkResume, libraryResume) => {
       logger.info(
-        `✅ Node Lavalink "${name}" terhubung! (lavalinkResume=${lavalinkResume}, libraryResume=${libraryResume})`
+        `[LavalinkWS] ✅ Lavalink WebSocket session READY: node="${name}", lavalinkResume=${lavalinkResume}, libraryResume=${libraryResume}`
       );
       if (client.audioDiagnostics) {
         client.audioDiagnostics.clearNodeNativeStatus(name);
+        client.audioDiagnostics.recordNodeAuthStatus(name, {
+          authenticated: true,
+          error: null,
+          updatedAt: Date.now()
+        });
       }
 
       const connectedNode = shoukaku.nodes.get(name);
@@ -47,50 +52,77 @@ module.exports = {
 
     shoukaku.on('error', (name, error) => {
       const msg = String(error?.message || error || '');
-      if (/401|403|Unauthorized|Forbidden/i.test(msg)) {
+      const isAuthFailure =
+        Boolean(error?.isAuthError) ||
+        error?.status === 401 ||
+        error?.status === 403 ||
+        /401|403|Unauthorized|Forbidden|Authentication failed/i.test(msg);
+
+      if (isAuthFailure) {
+        if (client.audioDiagnostics) {
+          client.audioDiagnostics.recordNodeAuthStatus(name, {
+            authenticated: false,
+            error: msg,
+            updatedAt: Date.now()
+          });
+          client.audioDiagnostics.recordTrackError({
+            guildId: null,
+            nodeName: name,
+            track: null,
+            stage: 'LAVALINK_WS_AUTH',
+            rawException: error
+          });
+        }
         logger.error(
-          `❌ Autentikasi Lavalink GAGAL pada node "${name}"! Periksa kecocokan LAVALINK_PASSWORD di .env dan application.yml.`
+          `[LavalinkWS] ❌ Autentikasi Lavalink GAGAL pada node "${name}"! Periksa kecocokan LAVALINK_PASSWORD di .env dan lavalink.server.password di application.yml (${msg}).`
         );
         return;
       }
+
       if (/ECONNREFUSED/i.test(msg)) {
         logger.warn(
           `⚠️ Node Lavalink "${name}" belum dapat dijangkau (ECONNREFUSED). Pastikan server Java Lavalink sudah dijalankan.`
         );
         return;
       }
+
       logger.error(`Error pada node Lavalink "${name}": ${msg}`);
     });
 
     shoukaku.on('close', (name, code, reason) => {
       logger.warn(
-        `Koneksi WebSocket Lavalink "${name}" tertutup (code=${code}, reason=${reason || 'tidak ada alasan'}).`
+        `[LavalinkWS] Koneksi WebSocket Lavalink "${name}" tertutup (code=${code}, reason=${reason || 'tidak ada alasan'}).`
       );
     });
 
     shoukaku.on('disconnect', (name, count) => {
       logger.warn(
-        `Node Lavalink "${name}" terputus setelah mencoba menyambung ulang (count=${count}). Health Monitor akan tetap memantau.`
+        `[LavalinkWS] Node Lavalink "${name}" terputus setelah mencoba menyambung ulang (count=${count}). Health Monitor menjadwalkan pendaftaran ulang otomatis...`
       );
+      // Shoukaku v4.3.0 menghapus node dari shoukaku.nodes saat event "disconnect" terjadi!
+      const retryTimer = setTimeout(() => {
+        if (!client.isReady()) return;
+        syncAndHealLavalinkNodes(client);
+      }, Math.max(3000, lavalinkConfig.shoukakuOptions.reconnectInterval * 1000));
+      if (typeof retryTimer.unref === 'function') {
+        retryTimer.unref();
+      }
     });
 
     shoukaku.on('reconnecting', (name, reconnectsLeft, reconnectInterval) => {
       logger.info(
-        `Menyambung ulang ke node Lavalink "${name}" dalam ${reconnectInterval} detik (sisa percobaan: ${reconnectsLeft})...`
+        `[LavalinkWS] Menyambung ulang ke node Lavalink "${name}" dalam ${reconnectInterval} detik (sisa percobaan: ${reconnectsLeft})...`
       );
     });
 
-    // Node Health Monitoring: otomatis menyambungkan kembali node yang terputus total setelah server Lavalink dinyalakan
+    // Node Health Monitoring: otomatis mendaftarkan ulang node yang terhapus saat disconnect & memuat ulang password baru
+    if (client.lavalinkHealthTimer) {
+      clearInterval(client.lavalinkHealthTimer);
+    }
+
     client.lavalinkHealthTimer = setInterval(() => {
       if (!client.isReady()) return;
-      for (const node of shoukaku.nodes.values()) {
-        if (node.state === Constants.State.DISCONNECTED) {
-          logger.debug(`[HealthMonitor] Mencoba menyambungkan kembali node "${node.name}"...`);
-          node.connect().catch((err) => {
-            logger.debug(`[HealthMonitor] Node "${node.name}" masih offline: ${err.message}`);
-          });
-        }
-      }
+      syncAndHealLavalinkNodes(client);
     }, lavalinkConfig.healthCheckIntervalMs);
 
     if (typeof client.lavalinkHealthTimer.unref === 'function') {
