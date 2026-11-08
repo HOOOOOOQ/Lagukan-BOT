@@ -17,6 +17,31 @@ module.exports = {
 
       // 1. Perubahan status suara milik Bot sendiri
       if (newState.id === client.user.id) {
+        logger.info(
+          `[VoiceState] Voice connection state: guild=${guild.id}, channel=${
+            newState.channelId || 'disconnected'
+          }, serverMute=${Boolean(newState.serverMute)}, selfMute=${Boolean(
+            newState.selfMute
+          )}, suppress=${Boolean(newState.suppress)}`
+        );
+
+        // Deteksi jika bot terkena Server Mute oleh moderator saat berada di voice channel
+        if (newState.channelId && !oldState.serverMute && newState.serverMute) {
+          logger.warn(
+            `[VoiceState] ⚠️ Bot terkena SERVER MUTE di guild=${guild.id} (channel=${newState.channelId})!`
+          );
+          await newState.setMute(false).catch(() => {});
+          if (newState.serverMute && musicPlayer && musicPlayer.playing) {
+            const { buildInfoEmbed } = require('../utils/embeds');
+            await musicPlayer.sendChannelEmbed(
+              buildInfoEmbed(
+                'Bot Sedang Di-Mute Server (Server Mute)',
+                '⚠️ Bot saat ini dalam status **Server Mute** di voice channel sehingga suara musik tidak akan terdengar. Klik kanan bot di voice channel lalu matikan **Server Mute**.'
+              )
+            );
+          }
+        }
+
         // Bot terputus / dikeluarkan dari voice channel
         if (oldState.channelId && !newState.channelId) {
           if (!musicPlayer) return;

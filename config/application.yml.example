@@ -89,7 +89,7 @@ lavalink:
     trackStuckThresholdMs: 10000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
-    playerUpdateInterval: 5
+    playerUpdateInterval: 2
     youtubeSearchEnabled: true
     soundcloudSearchEnabled: true
     gc-warnings: true

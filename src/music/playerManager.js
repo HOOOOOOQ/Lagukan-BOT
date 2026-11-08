@@ -71,6 +71,15 @@ class PlayerManager {
   requireAvailableNode() {
     const node = this.getAvailableNode();
     if (!node) {
+      for (const cfgNode of this.client.shoukaku?.nodes?.values?.() || []) {
+        const authState = this.client.audioDiagnostics?.getNodeAuthStatus?.(cfgNode.name);
+        if (authState && authState.authenticated === false) {
+          throw new AppError(
+            ErrorCodes.LAVALINK_OFFLINE,
+            'Autentikasi ke server **Lavalink** ditolak (`Authentication failed GET /v4/websocket` HTTP 401). Samakan `LAVALINK_PASSWORD` di `.env` dengan `lavalink.server.password` di `application.yml`, atau jalankan ulang Lavalink menggunakan `./scripts/start-lavalink-termux.sh`.'
+          );
+        }
+      }
       throw new AppError(
         ErrorCodes.LAVALINK_OFFLINE,
         'Server audio **Lavalink** saat ini sedang offline atau sedang menyambung ulang. Pastikan proses Java Lavalink aktif, lalu coba beberapa saat lagi.'
@@ -109,8 +118,10 @@ class PlayerManager {
     const id = String(guildId);
     const conn = this.client.shoukaku?.connections?.get(id) || null;
     const shoukakuPlayer = this.client.shoukaku?.players?.get(id) || null;
+    const musicPlayer = this.players.get(id) || null;
     const guild = this.client.guilds?.cache?.get(id) || null;
-    const botVoiceChannelId = guild?.members?.me?.voice?.channelId || null;
+    const botVoice = guild?.members?.me?.voice || null;
+    const botVoiceChannelId = botVoice?.channelId || null;
 
     const stateNames = {
       0: 'CONNECTING',
@@ -124,6 +135,13 @@ class PlayerManager {
       endpointHost = String(conn.serverUpdate.endpoint).split(':')[0];
     }
 
+    const pingVal =
+      typeof musicPlayer?.voicePingMs === 'number' && musicPlayer.voicePingMs >= 0
+        ? musicPlayer.voicePingMs
+        : typeof shoukakuPlayer?.ping === 'number'
+        ? shoukakuPlayer.ping
+        : null;
+
     return {
       botVoiceChannelId,
       shoukakuState: conn ? stateNames[conn.state] || `STATE_${conn.state}` : 'NONE',
@@ -133,9 +151,13 @@ class PlayerManager {
       endpointHost,
       region: conn?.region || null,
       deafened: Boolean(conn?.deafened),
-      muted: Boolean(conn?.muted),
+      muted: Boolean(conn?.muted || botVoice?.selfMute),
+      serverMute: Boolean(botVoice?.serverMute),
+      suppressed: Boolean(botVoice?.suppress),
       hasLavalinkPlayer: Boolean(shoukakuPlayer),
-      voicePingMs: typeof shoukakuPlayer?.ping === 'number' ? shoukakuPlayer.ping : null
+      lavalinkVoiceConnected: Boolean(musicPlayer?.voiceConnected),
+      audioPacketsSent: Boolean(musicPlayer?.audioPacketsSent),
+      voicePingMs: pingVal
     };
   }
 
@@ -150,8 +172,14 @@ class PlayerManager {
       if (textChannelId) {
         existing.textChannelId = String(textChannelId);
       }
-      // Pastikan koneksi Shoukaku masih hidup
-      if (existing.player && this.client.shoukaku.players.has(guildId)) {
+      const existingConn = this.client.shoukaku?.connections?.get(guildId);
+      const connAlive =
+        !existingConn || existingConn.state === Constants.State.CONNECTED;
+      // Pastikan koneksi Shoukaku masih hidup dan tidak terputus
+      if (existing.player && this.client.shoukaku.players.has(guildId) && connAlive) {
+        if (existingConn?.muted && typeof existingConn.setMute === 'function') {
+          existingConn.setMute(false);
+        }
         return existing;
       }
     }
@@ -229,6 +257,10 @@ class PlayerManager {
     }
 
     const voiceDiag = this.getVoiceDiagnostics(guildId);
+    logger.info(
+      `[DiscordVoice] ✅ Discord voice connected: guild=${guildId}, channel=${voiceChannel.id}, shoukakuState=${voiceDiag.shoukakuState}, session=${voiceDiag.hasSessionId}, serverHandshake=${voiceDiag.hasServerUpdate}, endpoint=${voiceDiag.endpointHost || 'ready'}`
+    );
+
     if (this.client.audioDiagnostics) {
       this.client.audioDiagnostics.recordStage(
         guildId,
@@ -236,6 +268,21 @@ class PlayerManager {
         'Handshake Voice State & Voice Server Siap',
         `state=${voiceDiag.shoukakuState}, session=${voiceDiag.hasSessionId}, endpoint=${voiceDiag.endpointHost || 'ready'}`
       );
+    }
+
+    // Pastikan bot tidak terkena Server Mute oleh moderator atau Self Mute pada sesi sebelumnya
+    try {
+      const me = guild.members?.me;
+      if (me?.voice?.serverMute) {
+        await me.voice.setMute(false).catch(() => {});
+        if (me.voice?.serverMute) {
+          logger.warn(
+            `[VoiceState] ⚠️ Bot dalam status SERVER MUTE oleh moderator di guild=${guildId} (channel=${voiceChannel.id})! Suara tidak akan keluar sampai di-unmute.`
+          );
+        }
+      }
+    } catch {
+      // Abaikan jika tidak memiliki izin MuteMembers
     }
 
     // Jika channel bertipe Stage Channel, coba aktifkan pembicara otomatis

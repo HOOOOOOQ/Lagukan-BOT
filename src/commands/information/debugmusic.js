@@ -80,12 +80,19 @@ module.exports = {
     let lavalinkConnText = '🔴 Tidak ada node Lavalink dikonfigurasi';
     if (primaryNode) {
       const stateLabel = NODE_STATE_LABELS[primaryNode.state] || `STATE_${primaryNode.state}`;
+      const authState = client.audioDiagnostics?.getNodeAuthStatus?.(primaryNode.name);
+      const authLabel =
+        primaryNode.state === Constants.State.CONNECTED
+          ? '🟢 Terautentikasi'
+          : authState && authState.authenticated === false
+          ? '🔴 Ditolak (HTTP 401/403 — Cek Password!)'
+          : '🟡 Menunggu Handshake';
       const stats = primaryNode.stats;
       const frameText = stats?.frameStats
         ? ` | Frames: \`sent=${stats.frameStats.sent}, nulled=${stats.frameStats.nulled}, deficit=${stats.frameStats.deficit}\``
         : '';
       lavalinkConnText =
-        `Node **${primaryNode.name}**: **${stateLabel}**\n` +
+        `Node **${primaryNode.name}**: **${stateLabel}** | WS Auth: **${authLabel}**\n` +
         `Session Aktif: \`${primaryNode.sessionId ? 'Ya' : 'Tidak'}\` | Reconnects: \`${primaryNode.reconnects || 0}\`\n` +
         `Players Node: \`${stats ? `${stats.playingPlayers}/${stats.players}` : '0/0'}\`${frameText}`;
     }
@@ -165,9 +172,23 @@ module.exports = {
     const voiceDiag = client.playerManager.getVoiceDiagnostics(interaction.guildId);
     const voiceChannelMention = voiceDiag.channelId ? `<#${voiceDiag.channelId}>` : '`Tidak terhubung`';
     const voicePingStr = voiceDiag.voicePingMs !== null ? `${voiceDiag.voicePingMs} ms` : 'N/A';
+    const udpLabel = voiceDiag.lavalinkVoiceConnected
+      ? '🟢 AKTIF'
+      : voiceDiag.channelId
+      ? '🟡 Siap / Menunggu Track'
+      : '⚪ Tidak Aktif';
+    const txLabel = voiceDiag.audioPacketsSent ? '🟢 Mengirim Paket' : '⚪ Idle';
+    const muteFlags = [
+      voiceDiag.serverMute ? '🔴 SERVER_MUTE' : null,
+      voiceDiag.muted ? '🟠 SELF_MUTE' : null,
+      voiceDiag.suppressed ? '🟠 STAGE_SUPPRESSED' : null
+    ]
+      .filter(Boolean)
+      .join(', ') || '🟢 Tidak Di-Mute';
     const voiceStatusText =
       `Channel: ${voiceChannelMention} | Shoukaku: \`${voiceDiag.shoukakuState}\`\n` +
       `Session ID: \`${voiceDiag.hasSessionId ? 'Siap' : 'Belum'}\` | Server Handshake: \`${voiceDiag.hasServerUpdate ? 'Siap' : 'Belum'}\`\n` +
+      `UDP Voice: **${udpLabel}** | Paket Audio: **${txLabel}** | Mute: **${muteFlags}**\n` +
       `Endpoint: \`${voiceDiag.endpointHost || '-'}\` | Ping Suara: \`${voicePingStr}\``;
 
     // 10. Current Player State & Pipeline Stage

@@ -1,7 +1,18 @@
 'use strict';
 
 const path = require('node:path');
-require('dotenv').config({ quiet: true });
+require('dotenv').config({ path: path.resolve(__dirname, '..', '.env'), quiet: true });
+
+function sanitizeSecret(value) {
+  let str = String(value ?? '').trim();
+  if (
+    (str.startsWith('"') && str.endsWith('"') && str.length >= 2) ||
+    (str.startsWith("'") && str.endsWith("'") && str.length >= 2)
+  ) {
+    str = str.slice(1, -1).trim();
+  }
+  return str;
+}
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -22,9 +33,9 @@ const config = {
     name: 'LaguKan',
     developer: '666pallxXx',
     version: '1.0.0',
-    token: (process.env.DISCORD_TOKEN || '').trim(),
-    clientId: (process.env.DISCORD_CLIENT_ID || '').trim(),
-    guildId: (process.env.DISCORD_GUILD_ID || '').trim(),
+    token: sanitizeSecret(process.env.DISCORD_TOKEN),
+    clientId: sanitizeSecret(process.env.DISCORD_CLIENT_ID),
+    guildId: sanitizeSecret(process.env.DISCORD_GUILD_ID),
     autoDeployCommands: parseBoolean(process.env.AUTO_DEPLOY_COMMANDS, false),
     defaultPrefix: '!'
   },
@@ -66,13 +77,13 @@ const config = {
   },
 
   database: {
-    path: path.resolve(process.cwd(), (process.env.DATABASE_PATH || './database/lagukan.sqlite').trim())
+    path: path.resolve(__dirname, '..', (process.env.DATABASE_PATH || './database/lagukan.sqlite').trim())
   },
 
   logging: {
     level: (process.env.LOG_LEVEL || 'info').trim().toLowerCase(),
     toFile: parseBoolean(process.env.LOG_TO_FILE, true),
-    filePath: path.resolve(process.cwd(), (process.env.LOG_FILE_PATH || './logs/lagukan.log').trim()),
+    filePath: path.resolve(__dirname, '..', (process.env.LOG_FILE_PATH || './logs/lagukan.log').trim()),
     maxFileSizeBytes: 5 * 1024 * 1024
   },
 
@@ -104,5 +115,6 @@ module.exports = {
   config,
   parseBoolean,
   parseInteger,
+  sanitizeSecret,
   validateConfig
 };

@@ -175,6 +175,30 @@ function classifyTrackFailure(rawException) {
   const stack = String(rawException?.causeStackTrace || rawException?.stack || '');
   const combined = logger.redactSecrets(`${msg}\n${cause}\n${stack}`);
 
+  if (/Authentication failed|HTTP 401|HTTP 403|401 Unauthorized/i.test(combined)) {
+    return {
+      code: 'LAVALINK_WS_AUTH_FAILED',
+      isNativeJniFailure: false,
+      shortReason: 'Autentikasi WebSocket Lavalink (/v4/websocket) gagal (HTTP 401/403)',
+      userMessage:
+        'Autentikasi WebSocket ke server Lavalink ditolak (`GET /v4/websocket` HTTP 401/403). Samakan nilai `LAVALINK_PASSWORD` di `.env` dengan `lavalink.server.password` di `application.yml`, atau jalankan `./scripts/start-lavalink-termux.sh` untuk menyinkronkannya otomatis.'
+    };
+  }
+
+  if (
+    /VOICE_TRANSPORT_NOT_CONNECTED|state\.connected\s*=\s*false|UDP\/Discord Voice transport/i.test(
+      combined
+    )
+  ) {
+    return {
+      code: 'VOICE_TRANSPORT_NOT_CONNECTED',
+      isNativeJniFailure: false,
+      shortReason: 'Transport suara Discord UDP / Voice Gateway gagal terhubung (state.connected=false)',
+      userMessage:
+        'Lavalink memutar track secara lokal namun koneksi suara UDP ke Discord gagal (`state.connected = false`, 0 paket audio terkirim). Di Android Termux ARM64, jalankan Lavalink menggunakan `./scripts/start-lavalink-termux.sh` (`proot-distro` Debian `glibc`) agar library `libdave-jvm.so` (Discord Voice DAVE E2EE) dan koneksi UDP aktif.'
+    };
+  }
+
   if (
     /AacDecoderLibrary|NativeLibraryLoader|ConnectorNativeLibLoader|libconnector|OpusDecoderLibrary|Mp3DecoderLibrary|UnsatisfiedLinkError|libgcc_s\.so|libc\.so\.6/i.test(
       combined
@@ -254,6 +278,9 @@ class AudioDiagnostics {
     this.errorHistory = [];
     /** @type {Map<string, { broken: boolean, code: string, detectedAt: number, detail: string }>} */
     this.nodeNativeStatus = new Map();
+
+    /** @type {Map<string, { authenticated: boolean, error: string|null, updatedAt: number }>} */
+    this.nodeAuthStatus = new Map();
     /** @type {Map<string, { stage: number, name: string, detail: string, updatedAt: number }>} */
     this.guildPipelineStage = new Map();
   }
@@ -327,6 +354,16 @@ class AudioDiagnostics {
   getNodeNativeStatus(nodeName) {
     if (!nodeName) return null;
     return this.nodeNativeStatus.get(String(nodeName)) || null;
+  }
+
+  recordNodeAuthStatus(nodeName, status) {
+    if (!nodeName) return;
+    this.nodeAuthStatus.set(String(nodeName), status);
+  }
+
+  getNodeAuthStatus(nodeName) {
+    if (!nodeName) return null;
+    return this.nodeAuthStatus.get(String(nodeName)) || null;
   }
 
   getRecentErrors(guildId = null, limit = 5) {
